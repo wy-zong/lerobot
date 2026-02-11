@@ -1137,9 +1137,17 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 )
                 if frame_index == 0:
                     img_path.parent.mkdir(parents=True, exist_ok=True)
-                compress_level = 1 if self.features[key]["dtype"] == "video" else 6
+                # Use compress_level=0 for fastest saving (no compression)
+                # compress_level = 0
+                compress_level = 0 if self.features[key]["dtype"] == "video" else 6
                 self._save_image(frame[key], img_path, compress_level)
-                self.episode_buffer[key].append(str(img_path))
+                # For image dtype, store relative path for cross-platform compatibility
+                # For video dtype, absolute path is fine (will be replaced by embed_images)
+                if self.features[key]["dtype"] == "image":
+                    # Use POSIX format (/) for cross-platform compatibility (Windows/Linux/WSL)
+                    self.episode_buffer[key].append(img_path.relative_to(self.root).as_posix())
+                else:
+                    self.episode_buffer[key].append(str(img_path))
             else:
                 self.episode_buffer[key].append(frame[key])
 
@@ -1192,7 +1200,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
 
         # Wait for image writer to end, so that episode stats over images can be computed
         self._wait_image_writer()
-        ep_stats = compute_episode_stats(episode_buffer, self.features)
+        ep_stats = compute_episode_stats(episode_buffer, self.features, root=self.root)
 
         ep_metadata = self._save_episode_data(episode_buffer)
         has_video_keys = len(self.meta.video_keys) > 0
@@ -1247,8 +1255,9 @@ class LeRobotDataset(torch.utils.data.Dataset):
                 self.episodes_since_last_encoding = 0
 
         if not episode_data:
-            # Reset episode buffer and clean up temporary images (if not already deleted during video encoding)
-            self.clear_episode_buffer(delete_images=len(self.meta.image_keys) > 0)
+            # Reset episode buffer and clean up temporary images only for video mode
+            # For image mode (use_videos=False), keep PNG files
+            self.clear_episode_buffer(delete_images=len(self.meta.video_keys) > 0)
 
     def _batch_save_episode_video(self, start_episode: int, end_episode: int | None = None) -> None:
         """
@@ -1319,7 +1328,10 @@ class LeRobotDataset(torch.utils.data.Dataset):
         # Convert buffer into HF Dataset
         ep_dict = {key: episode_buffer[key] for key in self.hf_features}
         ep_dataset = datasets.Dataset.from_dict(ep_dict, features=self.hf_features, split="train")
-        ep_dataset = embed_images(ep_dataset)
+        # Only embed images for video dtype (will be deleted after encoding to MP4)
+        # For image dtype (use_videos=False), keep PNG files without embedding
+        if len(self.meta.video_keys) > 0:
+            ep_dataset = embed_images(ep_dataset)
         ep_num_frames = len(ep_dataset)
 
         if self.latest_episode is None:

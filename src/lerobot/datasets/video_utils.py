@@ -304,7 +304,7 @@ def encode_video_frames(
     imgs_dir: Path | str,
     video_path: Path | str,
     fps: int,
-    vcodec: str = "libsvtav1",
+    vcodec: str = "h264",
     pix_fmt: str = "yuv420p",
     g: int | None = 2,
     crf: int | None = 30,
@@ -315,8 +315,8 @@ def encode_video_frames(
 ) -> None:
     """More info on ffmpeg arguments tuning on `benchmark/video/README.md`"""
     # Check encoder availability
-    if vcodec not in ["h264", "hevc", "libsvtav1"]:
-        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, hevc, libsvtav1.")
+    if vcodec not in ["h264", "h264_nvenc", "hevc", "libsvtav1"]:
+        raise ValueError(f"Unsupported video codec: {vcodec}. Supported codecs are: h264, h264_nvenc, hevc, libsvtav1.")
 
     video_path = Path(video_path)
     imgs_dir = Path(imgs_dir)
@@ -349,13 +349,20 @@ def encode_video_frames(
     # Define video codec options
     video_options = {}
 
-    if g is not None:
+    # NVENC encoders have different parameter requirements
+    is_nvenc = vcodec.endswith("_nvenc")
+
+    if g is not None and not is_nvenc:
         video_options["g"] = str(g)
 
-    if crf is not None:
+    if crf is not None and not is_nvenc:
         video_options["crf"] = str(crf)
+    elif is_nvenc:
+        # Use quality preset for NVENC instead of CRF
+        video_options["preset"] = "p4"  # Balanced quality/speed
+        video_options["rc"] = "vbr"  # Variable bitrate
 
-    if fast_decode:
+    if fast_decode and not is_nvenc:
         key = "svtav1-params" if vcodec == "libsvtav1" else "tune"
         value = f"fast-decode={fast_decode}" if vcodec == "libsvtav1" else "fastdecode"
         video_options[key] = value

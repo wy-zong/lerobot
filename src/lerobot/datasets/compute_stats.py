@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import numpy as np
+from pathlib import Path
 
 from lerobot.datasets.utils import load_image_as_numpy
 
@@ -227,12 +228,21 @@ def auto_downsample_height_width(img: np.ndarray, target_size: int = 150, max_si
     return img[:, ::downsample_factor, ::downsample_factor]
 
 
-def sample_images(image_paths: list[str]) -> np.ndarray:
+def sample_images(image_paths: list[str], root: Path | None = None) -> np.ndarray:
+    """Sample and load images from a list of paths.
+    
+    Args:
+        image_paths: List of image file paths (can be relative or absolute)
+        root: Root directory for resolving relative paths. If None, paths are used as-is.
+    """
     sampled_indices = sample_indices(len(image_paths))
 
     images = None
     for i, idx in enumerate(sampled_indices):
         path = image_paths[idx]
+        # Convert relative paths to absolute paths if root is provided
+        if root is not None and not Path(path).is_absolute():
+            path = str(root / path)
         # we load as uint8 to reduce memory usage
         img = load_image_as_numpy(path, dtype=np.uint8, channel_first=True)
         img = auto_downsample_height_width(img)
@@ -478,6 +488,7 @@ def compute_episode_stats(
     episode_data: dict[str, list[str] | np.ndarray],
     features: dict,
     quantile_list: list[float] | None = None,
+    root: Path | None = None,
 ) -> dict:
     """Compute comprehensive statistics for all features in an episode.
 
@@ -509,7 +520,7 @@ def compute_episode_stats(
             continue
 
         if features[key]["dtype"] in ["image", "video"]:
-            ep_ft_array = sample_images(data)
+            ep_ft_array = sample_images(data, root=root)
             axes_to_reduce = (0, 2, 3)
             keepdims = True
         else:

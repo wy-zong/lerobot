@@ -117,8 +117,8 @@ def aggregate_pipeline_dataset_features(
             )
 
             # 2. Apply filtering rules.
-            if is_image and not use_videos:
-                continue
+            # Note: We no longer skip images when use_videos=False.
+            # Instead, images will be stored in parquet with dtype="image".
             if not is_image and not should_keep(key, patterns):
                 continue
 

@@ -256,6 +256,7 @@ def aggregate_datasets(
 
     for src_meta in tqdm.tqdm(all_metadata, desc="Copy data and videos"):
         videos_idx = aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chunk_size)
+        aggregate_images(src_meta, dst_meta)
         data_idx = aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size)
 
         meta_idx = aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx)
@@ -378,6 +379,49 @@ def aggregate_videos(src_meta, dst_meta, videos_idx, video_files_size_in_mb, chu
         videos_idx[key]["file"] = file_idx
 
     return videos_idx
+
+
+def aggregate_images(src_meta, dst_meta):
+    """Aggregates images from a source dataset into the destination dataset.
+
+    Copies all image files from the source dataset's images directory to the
+    destination dataset, preserving the directory structure and renumbering
+    episode directories to avoid conflicts.
+
+    Args:
+        src_meta: Source dataset metadata.
+        dst_meta: Destination dataset metadata.
+    """
+    src_images_dir = src_meta.root / "images"
+    if not src_images_dir.exists():
+        return
+
+    dst_images_dir = dst_meta.root / "images"
+    episode_offset = dst_meta.info["total_episodes"]
+
+    # Copy all image files, preserving directory structure and renumbering episodes
+    for image_file in src_images_dir.rglob("*.png"):
+        relative_path = image_file.relative_to(src_images_dir)
+        
+        # Parse the episode number from the path (e.g., episode-000005)
+        parts = relative_path.parts
+        new_parts = []
+        for part in parts:
+            if part.startswith("episode-"):
+                # Extract episode number and add offset
+                episode_num = int(part.split("-")[1])
+                new_episode_num = episode_num + episode_offset
+                new_part = f"episode-{new_episode_num:06d}"
+                new_parts.append(new_part)
+            else:
+                new_parts.append(part)
+        
+        # Reconstruct the destination path with renumbered episode
+        new_relative_path = Path(*new_parts)
+        dst_file = dst_images_dir / new_relative_path
+        dst_file.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(image_file), str(dst_file))
+
 
 
 def aggregate_data(src_meta, dst_meta, data_idx, data_files_size_in_mb, chunk_size):

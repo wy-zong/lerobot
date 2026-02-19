@@ -117,8 +117,8 @@ def aggregate_pipeline_dataset_features(
             )
 
             # 2. Apply filtering rules.
-            if is_image and not use_videos:
-                continue
+            # if is_image and not use_videos:
+            #     continue
             if not is_image and not should_keep(key, patterns):
                 continue
 

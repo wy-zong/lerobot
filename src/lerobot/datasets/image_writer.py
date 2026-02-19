@@ -22,6 +22,8 @@ import numpy as np
 import PIL.Image
 import torch
 
+DEFAULT_JPEG_QUALITY = 85
+
 
 def safe_stop_image_writer(func):
     def wrapper(*args, **kwargs):
@@ -99,7 +101,13 @@ def write_image(image: np.ndarray | PIL.Image.Image, fpath: Path, compress_level
             img = image
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
-        img.save(fpath, compress_level=compress_level)
+        suffix = fpath.suffix.lower()
+        if suffix in {".jpg", ".jpeg"}:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img.save(fpath, format="JPEG", quality=DEFAULT_JPEG_QUALITY, optimize=True)
+        else:
+            img.save(fpath, compress_level=compress_level)
     except Exception as e:
         print(f"Error writing image {fpath}: {e}")
 

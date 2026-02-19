@@ -1086,6 +1086,8 @@ class LeRobotDataset(torch.utils.data.Dataset):
         fpath = DEFAULT_IMAGE_PATH.format(
             image_key=image_key, episode_index=episode_index, frame_index=frame_index
         )
+        if self.features[image_key]["dtype"] == "image":
+            fpath = fpath.removesuffix(".png") + ".jpg"
         return self.root / fpath
 
     def _get_image_file_dir(self, episode_index: int, image_key: str) -> Path:
@@ -1755,7 +1757,7 @@ class MultiLeRobotDataset(torch.utils.data.Dataset):
             f"  Repository IDs: '{self.repo_ids}',\n"
             f"  Number of Samples: {self.num_frames},\n"
             f"  Number of Episodes: {self.num_episodes},\n"
-            f"  Type: {'video (.mp4)' if self.video else 'image (.png)'},\n"
+            f"  Type: {'video (.mp4)' if self.video else 'image (.jpg)'},\n"
             f"  Recorded Frames per Second: {self.fps},\n"
             f"  Camera Keys: {self.camera_keys},\n"
             f"  Video Frame Keys: {self.video_frame_keys if self.video else 'N/A'},\n"

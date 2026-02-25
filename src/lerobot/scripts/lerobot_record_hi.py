@@ -56,11 +56,15 @@ from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import get_safe_torch_device, init_logging, log_say
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class RecordHIConfig(RecordConfig):
     # Enable policy+teleop intervention mode.
     human_intervention: bool = False
+    # Minimum teleop delta to arm intervention after toggling to intervention mode.
+    intervention_activation_delta: float = 3.0
 
     def __post_init__(self):
         super().__post_init__()
@@ -85,6 +89,7 @@ def record_loop_hi(
     single_task: str | None = None,
     display_data: bool = False,
     human_intervention: bool = False,
+    intervention_activation_delta: float = 3.0,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -94,8 +99,73 @@ def record_loop_hi(
         preprocessor.reset()
         postprocessor.reset()
 
+    if human_intervention and "intervention_active" in events:
+        # Each episode starts in policy mode.
+        events["intervention_active"] = False
+
+    def _policy_action_dict():
+        action_tensor = predict_action(
+            observation=observation_frame,
+            policy=policy,
+            device=get_safe_torch_device(policy.config.device),
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            use_amp=policy.config.use_amp,
+            task=single_task,
+            robot_type=robot.robot_type,
+        )
+        return make_robot_action(action_tensor, dataset.features)
+
+    def _sync_leader_to_action(action_dict: dict[str, float]) -> None:
+        if teleop is None:
+            return
+        try:
+            if hasattr(teleop, "bus"):
+                goal = {k.removesuffix(".pos"): v for k, v in action_dict.items() if k.endswith(".pos")}
+                teleop.bus.sync_write("Goal_Position", goal)
+                return
+
+            if hasattr(teleop, "left_arm") and hasattr(teleop, "right_arm"):
+                left_goal = {
+                    k.removeprefix("left_").removesuffix(".pos"): v
+                    for k, v in action_dict.items()
+                    if k.startswith("left_") and k.endswith(".pos")
+                }
+                right_goal = {
+                    k.removeprefix("right_").removesuffix(".pos"): v
+                    for k, v in action_dict.items()
+                    if k.startswith("right_") and k.endswith(".pos")
+                }
+                if left_goal:
+                    teleop.left_arm.bus.sync_write("Goal_Position", left_goal)
+                if right_goal:
+                    teleop.right_arm.bus.sync_write("Goal_Position", right_goal)
+        except Exception:
+            # Leader mirror is best-effort and should not break recording.
+            pass
+
+    def _action_delta(a: dict[str, float], b: dict[str, float]) -> float:
+        keys = set(a.keys()) & set(b.keys())
+        if not keys:
+            return 0.0
+        return max(abs(float(a[k]) - float(b[k])) for k in keys)
+
+    def _safe_read_teleop_action() -> dict[str, float] | None:
+        if teleop is None:
+            return None
+        try:
+            raw_action = teleop.get_action()
+            return teleop_action_processor((raw_action, obs))
+        except Exception as e:
+            # Do not abort recording on transient bus read issues.
+            logger.warning(f"Teleop action read failed, fallback to policy this step: {e}")
+            return None
+
     timestamp = 0
     start_episode_t = time.perf_counter()
+    intervention_armed = False
+    intervention_anchor_action = None
+
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
 
@@ -121,37 +191,50 @@ def record_loop_hi(
             and postprocessor is not None
         ):
             intervention_active = events.get("intervention_active", False)
+            if intervention_active and not intervention_armed:
+                act_processed_teleop = _safe_read_teleop_action()
+                if act_processed_teleop is not None:
+                    intervention_anchor_action = act_processed_teleop
+                    intervention_armed = True
+
             if intervention_active:
-                raw_action = teleop.get_action()
-                act_processed_teleop = teleop_action_processor((raw_action, obs))
-                action_values = act_processed_teleop
-                is_intervention = True
+                act_processed_teleop = _safe_read_teleop_action()
+                if act_processed_teleop is None:
+                    # Fallback to policy for this step if teleop read failed.
+                    action_values = _policy_action_dict()
+                    is_intervention = False
+                    robot_action_to_send = robot_action_processor((action_values, obs))
+                    _sent_action = robot.send_action(robot_action_to_send)
+                    if dataset is not None:
+                        action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
+                        frame = {**observation_frame, **action_frame, "task": single_task}
+                        if human_intervention:
+                            frame["complementary_info.is_intervention"] = np.array([False], dtype=np.bool_)
+                        dataset.add_frame(frame)
+                    if display_data:
+                        log_rerun_data(observation=obs_processed, action=action_values)
+                    dt_s = time.perf_counter() - start_loop_t
+                    precise_sleep(1 / fps - dt_s)
+                    timestamp = time.perf_counter() - start_episode_t
+                    continue
+
+                moved = False
+                if intervention_anchor_action is not None:
+                    moved = _action_delta(act_processed_teleop, intervention_anchor_action) >= intervention_activation_delta
+
+                if moved:
+                    action_values = act_processed_teleop
+                    is_intervention = True
+                else:
+                    action_values = _policy_action_dict()
+                    is_intervention = False
             else:
-                action_tensor = predict_action(
-                    observation=observation_frame,
-                    policy=policy,
-                    device=get_safe_torch_device(policy.config.device),
-                    preprocessor=preprocessor,
-                    postprocessor=postprocessor,
-                    use_amp=policy.config.use_amp,
-                    task=single_task,
-                    robot_type=robot.robot_type,
-                )
-                act_processed_policy = make_robot_action(action_tensor, dataset.features)
-                action_values = act_processed_policy
+                intervention_armed = False
+                intervention_anchor_action = None
+                action_values = _policy_action_dict()
+                _sync_leader_to_action(action_values)
         elif policy is not None and preprocessor is not None and postprocessor is not None:
-            action_tensor = predict_action(
-                observation=observation_frame,
-                policy=policy,
-                device=get_safe_torch_device(policy.config.device),
-                preprocessor=preprocessor,
-                postprocessor=postprocessor,
-                use_amp=policy.config.use_amp,
-                task=single_task,
-                robot_type=robot.robot_type,
-            )
-            act_processed_policy = make_robot_action(action_tensor, dataset.features)
-            action_values = act_processed_policy
+            action_values = _policy_action_dict()
         elif teleop is not None:
             raw_action = teleop.get_action()
             act_processed_teleop = teleop_action_processor((raw_action, obs))
@@ -160,10 +243,7 @@ def record_loop_hi(
             logging.info("No policy or teleoperator provided, skipping action generation.")
             continue
 
-        if policy is not None and act_processed_policy is not None:
-            robot_action_to_send = robot_action_processor((act_processed_policy, obs))
-        else:
-            robot_action_to_send = robot_action_processor((act_processed_teleop, obs))
+        robot_action_to_send = robot_action_processor((action_values, obs))
 
         _sent_action = robot.send_action(robot_action_to_send)
 
@@ -286,6 +366,7 @@ def record_hi(cfg: RecordHIConfig) -> LeRobotDataset:
                     single_task=cfg.dataset.single_task,
                     display_data=cfg.display_data,
                     human_intervention=cfg.human_intervention,
+                    intervention_activation_delta=cfg.intervention_activation_delta,
                 )
 
                 if not events["stop_recording"] and (

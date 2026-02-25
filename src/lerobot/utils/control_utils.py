@@ -115,7 +115,7 @@ def predict_action(
     return action
 
 
-def init_keyboard_listener():
+def init_keyboard_listener(enable_intervention: bool = False):
     """
     Initializes a non-blocking keyboard listener for real-time user interaction.
 
@@ -135,6 +135,8 @@ def init_keyboard_listener():
     events["exit_early"] = False
     events["rerecord_episode"] = False
     events["stop_recording"] = False
+    if enable_intervention:
+        events["intervention_active"] = False
 
     if is_headless():
         logging.warning(
@@ -159,6 +161,10 @@ def init_keyboard_listener():
                 print("Escape key pressed. Stopping data recording...")
                 events["stop_recording"] = True
                 events["exit_early"] = True
+            elif enable_intervention and key == keyboard.Key.space:
+                events["intervention_active"] = not events["intervention_active"]
+                state = "ON" if events["intervention_active"] else "OFF"
+                print(f"Human intervention toggled: {state}")
         except Exception as e:
             print(f"Error handling key press: {e}")
 

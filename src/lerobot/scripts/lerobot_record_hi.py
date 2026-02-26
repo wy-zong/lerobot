@@ -102,6 +102,7 @@ def record_loop_hi(
     if human_intervention and "intervention_active" in events:
         # Each episode starts in policy mode.
         events["intervention_active"] = False
+        events["intervention_unlocked"] = False
 
     def _policy_action_dict():
         action_tensor = predict_action(
@@ -144,12 +145,6 @@ def record_loop_hi(
             # Leader mirror is best-effort and should not break recording.
             pass
 
-    def _action_delta(a: dict[str, float], b: dict[str, float]) -> float:
-        keys = set(a.keys()) & set(b.keys())
-        if not keys:
-            return 0.0
-        return max(abs(float(a[k]) - float(b[k])) for k in keys)
-
     def _safe_read_teleop_action() -> dict[str, float] | None:
         if teleop is None:
             return None
@@ -175,7 +170,7 @@ def record_loop_hi(
         except Exception as e:
             logger.warning(f"Failed to set leader torque enabled={enabled}: {e}")
 
-    def _hold_leader_compliant(target_action: dict[str, float]) -> None:
+    def _hold_leader_position(target_action: dict[str, float]) -> None:
         if teleop is None or not hasattr(teleop, "bus"):
             return
         try:
@@ -183,11 +178,11 @@ def record_loop_hi(
             if goal:
                 teleop.bus.sync_write("Goal_Position", goal)
         except Exception as e:
-            logger.warning(f"Failed to apply compliant hold on leader: {e}")
+            logger.warning(f"Failed to hold leader position: {e}")
 
     timestamp = 0
     start_episode_t = time.perf_counter()
-    intervention_hold_action = None
+    locked_action = None
     prev_intervention_active = False
     leader_state = {"torque_enabled": None}
 
@@ -216,15 +211,19 @@ def record_loop_hi(
             and postprocessor is not None
         ):
             intervention_active = events.get("intervention_active", False)
+            intervention_unlocked = events.get("intervention_unlocked", False)
             if intervention_active and not prev_intervention_active:
                 act_processed_teleop = _safe_read_teleop_action()
-                intervention_hold_action = act_processed_teleop
+                locked_action = act_processed_teleop
 
-            if intervention_active:
+            if not intervention_active:
                 _set_leader_torque(True)
+                locked_action = None
             else:
-                _set_leader_torque(True)
-                intervention_hold_action = None
+                # In intervention mode:
+                # - locked: keep torque ON to hold position.
+                # - unlocked: torque OFF for near-zero resistance teleoperation.
+                _set_leader_torque(not intervention_unlocked)
 
             if intervention_active:
                 act_processed_teleop = _safe_read_teleop_action()
@@ -246,20 +245,13 @@ def record_loop_hi(
                     precise_sleep(1 / fps - dt_s)
                     timestamp = time.perf_counter() - start_episode_t
                     continue
-                # Immediate intervention semantics:
-                # - Leader always controls follower while intervention mode is ON.
-                # - Leader stays compliant by holding its own latest pose (not hard-locked to switch-time pose).
-                if intervention_hold_action is None:
-                    intervention_hold_action = act_processed_teleop
-                else:
-                    for k in intervention_hold_action:
-                        if k in act_processed_teleop:
-                            intervention_hold_action[k] = 0.9 * float(intervention_hold_action[k]) + 0.1 * float(
-                                act_processed_teleop[k]
-                            )
-                _hold_leader_compliant(intervention_hold_action)
+                # Immediate intervention: leader action always controls follower while intervention is ON.
                 action_values = act_processed_teleop
                 is_intervention = True
+                if not intervention_unlocked:
+                    if locked_action is None:
+                        locked_action = act_processed_teleop
+                    _hold_leader_position(locked_action)
             else:
                 action_values = _policy_action_dict()
                 _sync_leader_to_action(action_values)

@@ -137,6 +137,7 @@ def init_keyboard_listener(enable_intervention: bool = False):
     events["stop_recording"] = False
     if enable_intervention:
         events["intervention_active"] = False
+        events["intervention_unlocked"] = False
 
     if is_headless():
         logging.warning(
@@ -163,8 +164,16 @@ def init_keyboard_listener(enable_intervention: bool = False):
                 events["exit_early"] = True
             elif enable_intervention and key == keyboard.Key.space:
                 events["intervention_active"] = not events["intervention_active"]
+                # Entering or exiting intervention always resets unlock state.
+                events["intervention_unlocked"] = False
                 state = "ON" if events["intervention_active"] else "OFF"
                 print(f"Human intervention toggled: {state}")
+            elif enable_intervention and hasattr(keyboard.KeyCode, "from_char") and key == keyboard.KeyCode.from_char(
+                "f"
+            ):
+                if events.get("intervention_active", False):
+                    events["intervention_unlocked"] = True
+                    print("Human intervention unlocked: leader joint lock OFF")
         except Exception as e:
             print(f"Error handling key press: {e}")
 

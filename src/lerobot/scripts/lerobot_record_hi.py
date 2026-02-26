@@ -63,8 +63,8 @@ logger = logging.getLogger(__name__)
 class RecordHIConfig(RecordConfig):
     # Enable policy+teleop intervention mode.
     human_intervention: bool = False
-    # Minimum teleop delta to arm intervention after toggling to intervention mode.
-    intervention_activation_delta: float = 3.0
+    # Kept for backward compatibility; intervention now switches immediately.
+    intervention_activation_delta: float = 0.5
 
     def __post_init__(self):
         super().__post_init__()
@@ -89,7 +89,7 @@ def record_loop_hi(
     single_task: str | None = None,
     display_data: bool = False,
     human_intervention: bool = False,
-    intervention_activation_delta: float = 3.0,
+    intervention_activation_delta: float = 0.5,
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -161,10 +161,35 @@ def record_loop_hi(
             logger.warning(f"Teleop action read failed, fallback to policy this step: {e}")
             return None
 
+    def _set_leader_torque(enabled: bool) -> None:
+        if teleop is None or not hasattr(teleop, "bus"):
+            return
+        if leader_state["torque_enabled"] is enabled:
+            return
+        try:
+            if enabled:
+                teleop.bus.enable_torque(num_retry=1)
+            else:
+                teleop.bus.disable_torque(num_retry=1)
+            leader_state["torque_enabled"] = enabled
+        except Exception as e:
+            logger.warning(f"Failed to set leader torque enabled={enabled}: {e}")
+
+    def _hold_leader_compliant(target_action: dict[str, float]) -> None:
+        if teleop is None or not hasattr(teleop, "bus"):
+            return
+        try:
+            goal = {k.removesuffix(".pos"): v for k, v in target_action.items() if k.endswith(".pos")}
+            if goal:
+                teleop.bus.sync_write("Goal_Position", goal)
+        except Exception as e:
+            logger.warning(f"Failed to apply compliant hold on leader: {e}")
+
     timestamp = 0
     start_episode_t = time.perf_counter()
-    intervention_armed = False
-    intervention_anchor_action = None
+    intervention_hold_action = None
+    prev_intervention_active = False
+    leader_state = {"torque_enabled": None}
 
     while timestamp < control_time_s:
         start_loop_t = time.perf_counter()
@@ -191,11 +216,15 @@ def record_loop_hi(
             and postprocessor is not None
         ):
             intervention_active = events.get("intervention_active", False)
-            if intervention_active and not intervention_armed:
+            if intervention_active and not prev_intervention_active:
                 act_processed_teleop = _safe_read_teleop_action()
-                if act_processed_teleop is not None:
-                    intervention_anchor_action = act_processed_teleop
-                    intervention_armed = True
+                intervention_hold_action = act_processed_teleop
+
+            if intervention_active:
+                _set_leader_torque(True)
+            else:
+                _set_leader_torque(True)
+                intervention_hold_action = None
 
             if intervention_active:
                 act_processed_teleop = _safe_read_teleop_action()
@@ -217,22 +246,24 @@ def record_loop_hi(
                     precise_sleep(1 / fps - dt_s)
                     timestamp = time.perf_counter() - start_episode_t
                     continue
-
-                moved = False
-                if intervention_anchor_action is not None:
-                    moved = _action_delta(act_processed_teleop, intervention_anchor_action) >= intervention_activation_delta
-
-                if moved:
-                    action_values = act_processed_teleop
-                    is_intervention = True
+                # Immediate intervention semantics:
+                # - Leader always controls follower while intervention mode is ON.
+                # - Leader stays compliant by holding its own latest pose (not hard-locked to switch-time pose).
+                if intervention_hold_action is None:
+                    intervention_hold_action = act_processed_teleop
                 else:
-                    action_values = _policy_action_dict()
-                    is_intervention = False
+                    for k in intervention_hold_action:
+                        if k in act_processed_teleop:
+                            intervention_hold_action[k] = 0.9 * float(intervention_hold_action[k]) + 0.1 * float(
+                                act_processed_teleop[k]
+                            )
+                _hold_leader_compliant(intervention_hold_action)
+                action_values = act_processed_teleop
+                is_intervention = True
             else:
-                intervention_armed = False
-                intervention_anchor_action = None
                 action_values = _policy_action_dict()
                 _sync_leader_to_action(action_values)
+            prev_intervention_active = intervention_active
         elif policy is not None and preprocessor is not None and postprocessor is not None:
             action_values = _policy_action_dict()
         elif teleop is not None:

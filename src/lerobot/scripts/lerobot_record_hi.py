@@ -157,26 +157,53 @@ def record_loop_hi(
             return None
 
     def _set_leader_torque(enabled: bool) -> None:
-        if teleop is None or not hasattr(teleop, "bus"):
+        if teleop is None:
             return
         if leader_state["torque_enabled"] is enabled:
             return
         try:
-            if enabled:
-                teleop.bus.enable_torque(num_retry=1)
+            if hasattr(teleop, "bus"):
+                if enabled:
+                    teleop.bus.enable_torque(num_retry=1)
+                else:
+                    teleop.bus.disable_torque(num_retry=1)
+            elif hasattr(teleop, "left_arm") and hasattr(teleop, "right_arm"):
+                if enabled:
+                    teleop.left_arm.bus.enable_torque(num_retry=1)
+                    teleop.right_arm.bus.enable_torque(num_retry=1)
+                else:
+                    teleop.left_arm.bus.disable_torque(num_retry=1)
+                    teleop.right_arm.bus.disable_torque(num_retry=1)
             else:
-                teleop.bus.disable_torque(num_retry=1)
+                return
             leader_state["torque_enabled"] = enabled
         except Exception as e:
             logger.warning(f"Failed to set leader torque enabled={enabled}: {e}")
 
     def _hold_leader_position(target_action: dict[str, float]) -> None:
-        if teleop is None or not hasattr(teleop, "bus"):
+        if teleop is None:
             return
         try:
-            goal = {k.removesuffix(".pos"): v for k, v in target_action.items() if k.endswith(".pos")}
-            if goal:
-                teleop.bus.sync_write("Goal_Position", goal)
+            if hasattr(teleop, "bus"):
+                goal = {k.removesuffix(".pos"): v for k, v in target_action.items() if k.endswith(".pos")}
+                if goal:
+                    teleop.bus.sync_write("Goal_Position", goal)
+                return
+            if hasattr(teleop, "left_arm") and hasattr(teleop, "right_arm"):
+                left_goal = {
+                    k.removeprefix("left_").removesuffix(".pos"): v
+                    for k, v in target_action.items()
+                    if k.startswith("left_") and k.endswith(".pos")
+                }
+                right_goal = {
+                    k.removeprefix("right_").removesuffix(".pos"): v
+                    for k, v in target_action.items()
+                    if k.startswith("right_") and k.endswith(".pos")
+                }
+                if left_goal:
+                    teleop.left_arm.bus.sync_write("Goal_Position", left_goal)
+                if right_goal:
+                    teleop.right_arm.bus.sync_write("Goal_Position", right_goal)
         except Exception as e:
             logger.warning(f"Failed to hold leader position: {e}")
 

@@ -18,12 +18,11 @@ import logging
 import time
 from functools import cached_property
 
-from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.robots.so_follower import SOFollower, SOFollowerRobotConfig
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
 from ..robot import Robot
+from ..so_follower import SOFollower, SOFollowerRobotConfig
 from .config_bi_so_follower import BiSOFollowerConfig
 
 logger = logging.getLogger(__name__)

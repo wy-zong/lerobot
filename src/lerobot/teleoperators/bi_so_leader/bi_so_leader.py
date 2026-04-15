@@ -106,6 +106,35 @@ class BiSOLeader(Teleoperator):
 
         return action_dict
 
+    @check_if_not_connected
+    def enable_torque(self) -> None:
+        """Enable torque on both leader arms."""
+        self.left_arm.enable_torque()
+        self.right_arm.enable_torque()
+
+    @check_if_not_connected
+    def disable_torque(self) -> None:
+        """Disable torque on both leader arms so they can be freely moved by hand."""
+        self.left_arm.disable_torque()
+        self.right_arm.disable_torque()
+
+    @check_if_not_connected
+    def write_goal_positions(self, positions: dict[str, float]) -> None:
+        """Dispatch '<left|right>_<motor>.pos' entries to each arm after stripping the side prefix."""
+        left_goals: dict[str, float] = {}
+        right_goals: dict[str, float] = {}
+        for key, val in positions.items():
+            if not key.endswith(".pos"):
+                continue
+            if key.startswith("left_"):
+                left_goals[key.removeprefix("left_")] = float(val)
+            elif key.startswith("right_"):
+                right_goals[key.removeprefix("right_")] = float(val)
+        if left_goals:
+            self.left_arm.write_goal_positions(left_goals)
+        if right_goals:
+            self.right_arm.write_goal_positions(right_goals)
+
     def send_feedback(self, feedback: dict[str, float]) -> None:
         # TODO: Implement force feedback
         raise NotImplementedError

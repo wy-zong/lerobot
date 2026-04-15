@@ -145,6 +145,27 @@ class SOLeader(Teleoperator):
         logger.debug(f"{self} read action: {dt_ms:.1f}ms")
         return action
 
+    @check_if_not_connected
+    def enable_torque(self) -> None:
+        """Enable torque + lock so motors resist manual movement and accept Goal_Position."""
+        self.bus.enable_torque()
+
+    @check_if_not_connected
+    def disable_torque(self) -> None:
+        """Disable torque + lock so motors can be freely back-driven by the human."""
+        self.bus.disable_torque()
+
+    @check_if_not_connected
+    def write_goal_positions(self, positions: dict[str, float]) -> None:
+        """Send goal positions to motors. Keys are '<motor>.pos'; values match the leader's norm range."""
+        goals = {
+            key.removesuffix(".pos"): float(val)
+            for key, val in positions.items()
+            if key.endswith(".pos") and key.removesuffix(".pos") in self.bus.motors
+        }
+        if goals:
+            self.bus.sync_write("Goal_Position", goals)
+
     def send_feedback(self, feedback: dict[str, float]) -> None:
         # TODO: Implement force feedback
         raise NotImplementedError

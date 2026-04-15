@@ -98,6 +98,17 @@ def teleop_smooth_move_to(teleop: Teleoperator, target_pos: dict, duration_s: fl
         time.sleep(1 / fps)
 
 
+def detect_leader_motion(teleop: Teleoperator, baseline: dict[str, float]) -> float:
+    """Return max absolute joint deviation from baseline (in the same units as teleop.get_action)."""
+    now = teleop.get_action()
+    deviations = [
+        abs(float(now[k]) - float(baseline[k]))
+        for k in baseline
+        if k in now and k.endswith(".pos")
+    ]
+    return max(deviations) if deviations else 0.0
+
+
 def init_keyboard_listener():
     """Initialize keyboard listener with HIL controls."""
     events = {
@@ -106,6 +117,7 @@ def init_keyboard_listener():
         "stop_recording": False,
         "policy_paused": False,
         "correction_active": False,
+        "waiting_for_motion": False,
         "resume_policy": False,
         "in_reset": False,
         "start_next_episode": False,
@@ -209,6 +221,7 @@ def reset_loop(robot: Robot, teleop: Teleoperator, events: dict, fps: int):
     events["exit_early"] = False
     events["policy_paused"] = False
     events["correction_active"] = False
+    events["waiting_for_motion"] = False
     events["resume_policy"] = False
 
 

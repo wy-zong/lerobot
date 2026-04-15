@@ -104,6 +104,7 @@ from typing import Any
 import torch
 from hil_utils import (
     HILDatasetConfig,
+    detect_leader_motion,
     init_keyboard_listener,
     make_identity_processors,
     print_controls,
@@ -137,8 +138,10 @@ from lerobot.processor import (
 )
 from lerobot.robots import Robot, RobotConfig, make_robot_from_config
 from lerobot.robots.bi_openarm_follower import BiOpenArmFollowerConfig
+from lerobot.robots.bi_so_follower import BiSOFollowerConfig  # noqa: F401
 from lerobot.robots.so_follower import SOFollowerRobotConfig  # noqa: F401
 from lerobot.teleoperators import Teleoperator, TeleoperatorConfig, make_teleoperator_from_config
+from lerobot.teleoperators.bi_so_leader import BiSOLeaderConfig  # noqa: F401
 from lerobot.teleoperators.openarm_mini import OpenArmMiniConfig  # noqa: F401
 from lerobot.teleoperators.so_leader import SOLeaderTeleopConfig  # noqa: F401
 from lerobot.utils import get_safe_torch_device
@@ -514,6 +517,9 @@ class HILConfig:
     rtc: RTCConfig = field(default_factory=RTCConfig)
     interpolation_multiplier: int = 2
     record_interpolated_actions: bool = False
+    motion_detection_threshold_deg: float = 3.0
+    motion_detection_hold_frames: int = 3
+    handover_transition_s: float = 0.3
     display_data: bool = True
     play_sounds: bool = True
     resume: bool = False
@@ -577,6 +583,12 @@ def _rollout_sync(
         if key.startswith(f"{OBS_STR}.images.")
     ]
 
+    leader_baseline: dict[str, float] | None = None
+    motion_hold_counter = 0
+    transition_start_pos: dict[str, float] | None = None
+    transition_steps_total = 0
+    transition_step_i = 0
+
     interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
     control_interval = interpolator.get_control_interval(fps)
 
@@ -594,19 +606,29 @@ def _rollout_sync(
             events["exit_early"] = False
             events["policy_paused"] = False
             events["correction_active"] = False
+            events["waiting_for_motion"] = False
             events["resume_policy"] = False
             break
 
         if events["resume_policy"] and (
-            events["policy_paused"] or events["correction_active"] or waiting_for_takeover
+            events["policy_paused"]
+            or events["correction_active"]
+            or events["waiting_for_motion"]
+            or waiting_for_takeover
         ):
             events["resume_policy"] = False
             events["start_next_episode"] = False
             events["policy_paused"] = False
             events["correction_active"] = False
+            events["waiting_for_motion"] = False
             waiting_for_takeover = False
             was_paused = False
             last_action = None
+            leader_baseline = None
+            motion_hold_counter = 0
+            transition_start_pos = None
+            transition_steps_total = 0
+            transition_step_i = 0
             interpolator.reset()
             policy.reset()
             preprocessor.reset()
@@ -624,10 +646,16 @@ def _rollout_sync(
             interpolator.reset()
 
         if waiting_for_takeover and events["start_next_episode"]:
-            teleop_disable_torque(teleop)
+            leader_baseline = teleop.get_action()
+            motion_hold_counter = 0
             events["start_next_episode"] = False
-            events["correction_active"] = True
+            events["waiting_for_motion"] = True
             waiting_for_takeover = False
+            logger.info(
+                "[HIL] Holding follower - push leader >%.1f° (against torque) for %d frames to start recording",
+                cfg.motion_detection_threshold_deg,
+                cfg.motion_detection_hold_frames,
+            )
 
         obs = robot.get_observation()
         obs_filtered = {k: obs[k] for k in obs_state_names if k in obs}
@@ -635,7 +663,21 @@ def _rollout_sync(
         obs_frame = build_dataset_frame(dataset.features, obs_filtered, prefix=OBS_STR)
 
         if events["correction_active"]:
-            robot_action = teleop.get_action()
+            leader_action = teleop.get_action()
+            if (
+                transition_start_pos is not None
+                and transition_step_i < transition_steps_total
+            ):
+                denom = max(transition_steps_total - 1, 1)
+                t = min(transition_step_i / denom, 1.0)
+                robot_action = {
+                    k: (1.0 - t) * float(transition_start_pos[k]) + t * float(leader_action[k])
+                    for k in leader_action
+                    if k in transition_start_pos
+                }
+                transition_step_i += 1
+            else:
+                robot_action = leader_action
             robot.send_action(robot_action)
             robot_command_count += 1
             action_frame = build_dataset_frame(dataset.features, robot_action, prefix=ACTION)
@@ -646,6 +688,35 @@ def _rollout_sync(
                 else:
                     frame_buffer.append(frame)
             record_tick += 1
+
+        elif events["waiting_for_motion"]:
+            hold_pos = last_action
+            if hold_pos is None:
+                hold_pos = {
+                    k: v for k, v in obs.items()
+                    if k.endswith(".pos") and k in robot.observation_features
+                }
+            if hold_pos:
+                robot.send_action(hold_pos)
+                robot_command_count += 1
+            if leader_baseline is not None:
+                deviation = detect_leader_motion(teleop, leader_baseline)
+                if deviation > cfg.motion_detection_threshold_deg:
+                    motion_hold_counter += 1
+                else:
+                    motion_hold_counter = 0
+                if motion_hold_counter >= cfg.motion_detection_hold_frames:
+                    teleop_disable_torque(teleop)
+                    transition_start_pos = dict(hold_pos) if hold_pos else teleop.get_action()
+                    transition_steps_total = max(int(cfg.handover_transition_s * fps), 1)
+                    transition_step_i = 0
+                    events["waiting_for_motion"] = False
+                    events["correction_active"] = True
+                    logger.info(
+                        "[HIL] Motion detected (%.2f°) - torque released, smooth handover over %d frames",
+                        deviation,
+                        transition_steps_total,
+                    )
 
         elif waiting_for_takeover or events["policy_paused"]:
             if last_action:
@@ -746,6 +817,11 @@ def _rollout_rtc(
     was_paused = False
     waiting_for_takeover = False
     last_action: dict[str, Any] | None = None
+    leader_baseline: dict[str, float] | None = None
+    motion_hold_counter = 0
+    transition_start_pos: dict[str, float] | None = None
+    transition_steps_total = 0
+    transition_step_i = 0
     dataset_action_keys = list(dataset.features[ACTION]["names"])
     action_keys = _resolve_action_key_order(cfg, dataset_action_keys)
     if action_keys != dataset_action_keys:
@@ -782,19 +858,29 @@ def _rollout_rtc(
             events["exit_early"] = False
             events["policy_paused"] = False
             events["correction_active"] = False
+            events["waiting_for_motion"] = False
             events["resume_policy"] = False
             break
 
         if events["resume_policy"] and (
-            events["policy_paused"] or events["correction_active"] or waiting_for_takeover
+            events["policy_paused"]
+            or events["correction_active"]
+            or events["waiting_for_motion"]
+            or waiting_for_takeover
         ):
             events["resume_policy"] = False
             events["start_next_episode"] = False
             events["policy_paused"] = False
             events["correction_active"] = False
+            events["waiting_for_motion"] = False
             waiting_for_takeover = False
             was_paused = False
             last_action = None
+            leader_baseline = None
+            motion_hold_counter = 0
+            transition_start_pos = None
+            transition_steps_total = 0
+            transition_step_i = 0
             interpolator.reset()
             queue_holder["queue"] = ActionQueue(cfg.rtc)
             policy_active.clear()
@@ -815,17 +901,24 @@ def _rollout_rtc(
             interpolator.reset()
 
         if waiting_for_takeover and events["start_next_episode"]:
-            teleop_disable_torque(teleop)
+            leader_baseline = teleop.get_action()
+            motion_hold_counter = 0
             events["start_next_episode"] = False
-            events["correction_active"] = True
+            events["waiting_for_motion"] = True
             waiting_for_takeover = False
             queue_holder["queue"] = ActionQueue(cfg.rtc)
+            logger.info(
+                "[HIL] Holding follower - push leader >%.1f° (against torque) for %d frames to start recording",
+                cfg.motion_detection_threshold_deg,
+                cfg.motion_detection_hold_frames,
+            )
 
         now_for_obs = time.perf_counter()
         should_poll_obs = (
             not obs_filtered
             or (now_for_obs - last_obs_poll_t) >= obs_poll_interval
             or events["correction_active"]
+            or events["waiting_for_motion"]
             or waiting_for_takeover
             or events["policy_paused"]
         )
@@ -839,7 +932,21 @@ def _rollout_rtc(
             last_obs_poll_t = now_for_obs
 
         if events["correction_active"]:
-            robot_action = teleop.get_action()
+            leader_action = teleop.get_action()
+            if (
+                transition_start_pos is not None
+                and transition_step_i < transition_steps_total
+            ):
+                denom = max(transition_steps_total - 1, 1)
+                t = min(transition_step_i / denom, 1.0)
+                robot_action = {
+                    k: (1.0 - t) * float(transition_start_pos[k]) + t * float(leader_action[k])
+                    for k in leader_action
+                    if k in transition_start_pos
+                }
+                transition_step_i += 1
+            else:
+                robot_action = leader_action
             robot.send_action(robot_action)
             robot_command_count += 1
             action_frame = build_dataset_frame(dataset.features, robot_action, prefix=ACTION)
@@ -850,6 +957,35 @@ def _rollout_rtc(
                 else:
                     frame_buffer.append(frame)
             record_tick += 1
+
+        elif events["waiting_for_motion"]:
+            hold_pos = last_action
+            if hold_pos is None:
+                hold_pos = {
+                    k: v for k, v in obs_filtered.items()
+                    if k.endswith(".pos")
+                }
+            if hold_pos:
+                robot.send_action(hold_pos)
+                robot_command_count += 1
+            if leader_baseline is not None:
+                deviation = detect_leader_motion(teleop, leader_baseline)
+                if deviation > cfg.motion_detection_threshold_deg:
+                    motion_hold_counter += 1
+                else:
+                    motion_hold_counter = 0
+                if motion_hold_counter >= cfg.motion_detection_hold_frames:
+                    teleop_disable_torque(teleop)
+                    transition_start_pos = dict(hold_pos) if hold_pos else teleop.get_action()
+                    transition_steps_total = max(int(cfg.handover_transition_s * fps), 1)
+                    transition_step_i = 0
+                    events["waiting_for_motion"] = False
+                    events["correction_active"] = True
+                    logger.info(
+                        "[HIL] Motion detected (%.2f°) - torque released, smooth handover over %d frames",
+                        deviation,
+                        transition_steps_total,
+                    )
 
         elif waiting_for_takeover or events["policy_paused"]:
             if last_action:
@@ -1031,7 +1167,7 @@ def hil_collect(cfg: HILConfig) -> LeRobotDataset:
             policy = policy.to(cfg.device)
             policy.eval()
         else:
-            policy = make_policy(cfg.policy, ds_meta=dataset.meta)
+            policy = make_policy(cfg.policy, ds_meta=dataset.meta, rename_map=cfg.dataset.rename_map)
 
         preprocessor, postprocessor = make_pre_post_processors(
             policy_cfg=cfg.policy,

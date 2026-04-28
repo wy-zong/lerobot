@@ -12,20 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Real-Time Chunking (RTC) utilities for action-chunking policies."""
+"""Rollout strategies — public API re-exports."""
 
-from .action_interpolator import ActionInterpolator
-from .action_queue import ActionQueue
-from .configuration_rtc import RTCConfig
-from .latency_tracker import LatencyTracker
-from .modeling_rtc import RTCProcessor
-from .relative import reanchor_relative_rtc_prefix
+from .base import BaseStrategy
+from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
+from .dagger import DAggerEvents, DAggerPhase, DAggerStrategy
+from .factory import create_strategy
+from .highlight import HighlightStrategy
+from .sentry import SentryStrategy
 
 __all__ = [
-    "ActionInterpolator",
-    "ActionQueue",
-    "LatencyTracker",
-    "RTCConfig",
-    "RTCProcessor",
-    "reanchor_relative_rtc_prefix",
+    "BaseStrategy",
+    "DAggerEvents",
+    "DAggerPhase",
+    "DAggerStrategy",
+    "HighlightStrategy",
+    "RolloutStrategy",
+    "SentryStrategy",
+    "create_strategy",
+    "estimate_max_episode_seconds",
+    "safe_push_to_hub",
+    "send_next_action",
 ]

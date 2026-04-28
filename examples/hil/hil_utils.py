@@ -98,13 +98,12 @@ def teleop_smooth_move_to(teleop: Teleoperator, target_pos: dict, duration_s: fl
         time.sleep(1 / fps)
 
 
-def detect_leader_motion(teleop: Teleoperator, baseline: dict[str, float]) -> float:
-    """Return max absolute joint deviation from baseline (in the same units as teleop.get_action)."""
-    now = teleop.get_action()
+def detect_leader_motion(leader_action: dict[str, float], baseline: dict[str, float]) -> float:
+    """Return max absolute joint deviation from baseline for a sampled leader action."""
     deviations = [
-        abs(float(now[k]) - float(baseline[k]))
+        abs(float(leader_action[k]) - float(baseline[k]))
         for k in baseline
-        if k in now and k.endswith(".pos")
+        if k in leader_action and k.endswith(".pos")
     ]
     return max(deviations) if deviations else 0.0
 

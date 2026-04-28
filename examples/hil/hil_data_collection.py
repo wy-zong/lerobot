@@ -519,6 +519,8 @@ class HILConfig:
     record_interpolated_actions: bool = False
     motion_detection_threshold_deg: float = 3.0
     motion_detection_hold_frames: int = 3
+    motion_detection_poll_hz: float = 15.0
+    hold_resend_hz: float = 10.0
     handover_transition_s: float = 0.3
     display_data: bool = True
     play_sounds: bool = True
@@ -584,23 +586,31 @@ def _rollout_sync(
     ]
 
     leader_baseline: dict[str, float] | None = None
+    cached_leader_action: dict[str, float] | None = None
     motion_hold_counter = 0
+    motion_poll_count = 0
+    hold_resend_count = 0
     transition_start_pos: dict[str, float] | None = None
     transition_steps_total = 0
     transition_step_i = 0
 
     interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
     control_interval = interpolator.get_control_interval(fps)
+    motion_poll_interval = 1.0 / max(float(cfg.motion_detection_poll_hz), 1e-6)
+    hold_resend_interval = 1.0 / max(float(cfg.hold_resend_hz), 1e-6)
 
     timestamp = 0.0
     record_tick = 0
     start_t = time.perf_counter()
     stats_window_start = start_t
+    last_motion_poll_t = start_t - motion_poll_interval
+    last_hold_send_t = start_t - hold_resend_interval
     policy_inference_count = 0
     robot_command_count = 0
 
     while timestamp < cfg.dataset.episode_time_s:
         loop_start = time.perf_counter()
+        robot_action = {}
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -625,10 +635,16 @@ def _rollout_sync(
             was_paused = False
             last_action = None
             leader_baseline = None
+            cached_leader_action = None
             motion_hold_counter = 0
+            motion_poll_count = 0
+            hold_resend_count = 0
             transition_start_pos = None
             transition_steps_total = 0
             transition_step_i = 0
+            now_reset = time.perf_counter()
+            last_motion_poll_t = now_reset - motion_poll_interval
+            last_hold_send_t = now_reset - hold_resend_interval
             interpolator.reset()
             policy.reset()
             preprocessor.reset()
@@ -647,14 +663,20 @@ def _rollout_sync(
 
         if waiting_for_takeover and events["start_next_episode"]:
             leader_baseline = teleop.get_action()
+            cached_leader_action = leader_baseline
             motion_hold_counter = 0
             events["start_next_episode"] = False
             events["waiting_for_motion"] = True
             waiting_for_takeover = False
+            now_waiting = time.perf_counter()
+            last_motion_poll_t = now_waiting
+            last_hold_send_t = now_waiting - hold_resend_interval
             logger.info(
-                "[HIL] Holding follower - push leader >%.1f° (against torque) for %d frames to start recording",
+                "[HIL] Holding follower - push leader >%.1f° for %d frames to start recording (leader poll %.1f Hz, hold resend %.1f Hz)",
                 cfg.motion_detection_threshold_deg,
                 cfg.motion_detection_hold_frames,
+                cfg.motion_detection_poll_hz,
+                cfg.hold_resend_hz,
             )
 
         obs = robot.get_observation()
@@ -690,24 +712,35 @@ def _rollout_sync(
             record_tick += 1
 
         elif events["waiting_for_motion"]:
+            now_waiting = time.perf_counter()
             hold_pos = last_action
             if hold_pos is None:
                 hold_pos = {
                     k: v for k, v in obs.items()
                     if k.endswith(".pos") and k in robot.observation_features
                 }
-            if hold_pos:
+            if hold_pos and (now_waiting - last_hold_send_t) >= hold_resend_interval:
                 robot.send_action(hold_pos)
+                robot_action = hold_pos
                 robot_command_count += 1
+                hold_resend_count += 1
+                last_hold_send_t = now_waiting
             if leader_baseline is not None:
-                deviation = detect_leader_motion(teleop, leader_baseline)
+                if (
+                    cached_leader_action is None
+                    or (now_waiting - last_motion_poll_t) >= motion_poll_interval
+                ):
+                    cached_leader_action = teleop.get_action()
+                    motion_poll_count += 1
+                    last_motion_poll_t = now_waiting
+                deviation = detect_leader_motion(cached_leader_action, leader_baseline)
                 if deviation > cfg.motion_detection_threshold_deg:
                     motion_hold_counter += 1
                 else:
                     motion_hold_counter = 0
                 if motion_hold_counter >= cfg.motion_detection_hold_frames:
                     teleop_disable_torque(teleop)
-                    transition_start_pos = dict(hold_pos) if hold_pos else teleop.get_action()
+                    transition_start_pos = dict(hold_pos) if hold_pos else dict(cached_leader_action)
                     transition_steps_total = max(int(cfg.handover_transition_s * fps), 1)
                     transition_step_i = 0
                     events["waiting_for_motion"] = False
@@ -768,15 +801,19 @@ def _rollout_sync(
             policy_hz = policy_inference_count / window_elapsed
             robot_hz = robot_command_count / window_elapsed
             logger.info(
-                "[HIL rates] policy=%.1f Hz (target=%.1f) | robot=%.1f Hz (target=%.1f)",
+                "[HIL rates] policy=%.1f Hz (target=%.1f) | robot=%.1f Hz (target=%.1f) | motion_poll=%.1f Hz | hold_resend=%.1f Hz",
                 policy_hz,
                 fps,
                 robot_hz,
                 fps * cfg.interpolation_multiplier,
+                motion_poll_count / window_elapsed,
+                hold_resend_count / window_elapsed,
             )
             stats_window_start = now
             policy_inference_count = 0
             robot_command_count = 0
+            motion_poll_count = 0
+            hold_resend_count = 0
 
     teleop_disable_torque(teleop)
 
@@ -818,7 +855,10 @@ def _rollout_rtc(
     waiting_for_takeover = False
     last_action: dict[str, Any] | None = None
     leader_baseline: dict[str, float] | None = None
+    cached_leader_action: dict[str, float] | None = None
     motion_hold_counter = 0
+    motion_poll_count = 0
+    hold_resend_count = 0
     transition_start_pos: dict[str, float] | None = None
     transition_steps_total = 0
     transition_step_i = 0
@@ -837,11 +877,15 @@ def _rollout_rtc(
 
     interpolator = ActionInterpolator(multiplier=cfg.interpolation_multiplier)
     control_interval = interpolator.get_control_interval(fps)
+    motion_poll_interval = 1.0 / max(float(cfg.motion_detection_poll_hz), 1e-6)
+    hold_resend_interval = 1.0 / max(float(cfg.hold_resend_hz), 1e-6)
 
     robot_action: dict[str, Any] = {}
     timestamp = 0.0
     start_t = time.perf_counter()
     stats_window_start = start_t
+    last_motion_poll_t = start_t - motion_poll_interval
+    last_hold_send_t = start_t - hold_resend_interval
     robot_command_count = 0
     record_tick = 0
     obs_poll_interval = 1.0 / fps
@@ -853,6 +897,7 @@ def _rollout_rtc(
 
     while timestamp < cfg.dataset.episode_time_s:
         loop_start = time.perf_counter()
+        robot_action = {}
 
         if events["exit_early"]:
             events["exit_early"] = False
@@ -877,10 +922,16 @@ def _rollout_rtc(
             was_paused = False
             last_action = None
             leader_baseline = None
+            cached_leader_action = None
             motion_hold_counter = 0
+            motion_poll_count = 0
+            hold_resend_count = 0
             transition_start_pos = None
             transition_steps_total = 0
             transition_step_i = 0
+            now_reset = time.perf_counter()
+            last_motion_poll_t = now_reset - motion_poll_interval
+            last_hold_send_t = now_reset - hold_resend_interval
             interpolator.reset()
             queue_holder["queue"] = ActionQueue(cfg.rtc)
             policy_active.clear()
@@ -902,15 +953,21 @@ def _rollout_rtc(
 
         if waiting_for_takeover and events["start_next_episode"]:
             leader_baseline = teleop.get_action()
+            cached_leader_action = leader_baseline
             motion_hold_counter = 0
             events["start_next_episode"] = False
             events["waiting_for_motion"] = True
             waiting_for_takeover = False
             queue_holder["queue"] = ActionQueue(cfg.rtc)
+            now_waiting = time.perf_counter()
+            last_motion_poll_t = now_waiting
+            last_hold_send_t = now_waiting - hold_resend_interval
             logger.info(
-                "[HIL] Holding follower - push leader >%.1f° (against torque) for %d frames to start recording",
+                "[HIL] Holding follower - push leader >%.1f° for %d frames to start recording (leader poll %.1f Hz, hold resend %.1f Hz)",
                 cfg.motion_detection_threshold_deg,
                 cfg.motion_detection_hold_frames,
+                cfg.motion_detection_poll_hz,
+                cfg.hold_resend_hz,
             )
 
         now_for_obs = time.perf_counter()
@@ -959,24 +1016,35 @@ def _rollout_rtc(
             record_tick += 1
 
         elif events["waiting_for_motion"]:
+            now_waiting = time.perf_counter()
             hold_pos = last_action
             if hold_pos is None:
                 hold_pos = {
                     k: v for k, v in obs_filtered.items()
                     if k.endswith(".pos")
                 }
-            if hold_pos:
+            if hold_pos and (now_waiting - last_hold_send_t) >= hold_resend_interval:
                 robot.send_action(hold_pos)
+                robot_action = hold_pos
                 robot_command_count += 1
+                hold_resend_count += 1
+                last_hold_send_t = now_waiting
             if leader_baseline is not None:
-                deviation = detect_leader_motion(teleop, leader_baseline)
+                if (
+                    cached_leader_action is None
+                    or (now_waiting - last_motion_poll_t) >= motion_poll_interval
+                ):
+                    cached_leader_action = teleop.get_action()
+                    motion_poll_count += 1
+                    last_motion_poll_t = now_waiting
+                deviation = detect_leader_motion(cached_leader_action, leader_baseline)
                 if deviation > cfg.motion_detection_threshold_deg:
                     motion_hold_counter += 1
                 else:
                     motion_hold_counter = 0
                 if motion_hold_counter >= cfg.motion_detection_hold_frames:
                     teleop_disable_torque(teleop)
-                    transition_start_pos = dict(hold_pos) if hold_pos else teleop.get_action()
+                    transition_start_pos = dict(hold_pos) if hold_pos else dict(cached_leader_action)
                     transition_steps_total = max(int(cfg.handover_transition_s * fps), 1)
                     transition_step_i = 0
                     events["waiting_for_motion"] = False
@@ -1045,12 +1113,16 @@ def _rollout_rtc(
         if cfg.log_hz and (window_elapsed := now - stats_window_start) >= cfg.hz_log_interval_s:
             robot_hz = robot_command_count / window_elapsed
             logger.info(
-                "[HIL RTC rates] robot=%.1f Hz (target=%.1f)",
+                "[HIL RTC rates] robot=%.1f Hz (target=%.1f) | motion_poll=%.1f Hz | hold_resend=%.1f Hz",
                 robot_hz,
                 fps * cfg.interpolation_multiplier,
+                motion_poll_count / window_elapsed,
+                hold_resend_count / window_elapsed,
             )
             stats_window_start = now
             robot_command_count = 0
+            motion_poll_count = 0
+            hold_resend_count = 0
 
     policy_active.clear()
     teleop_disable_torque(teleop)

@@ -91,15 +91,15 @@ class SOFollower(Robot):
         and torque can be safely disabled to run calibration.
         """
 
+        for cam in self.cameras.values():
+            cam.connect()
+
         self.bus.connect()
         if not self.is_calibrated and calibrate:
             logger.info(
                 "Mismatch between calibration values in the motor and the calibration file or no calibration file found"
             )
             self.calibrate()
-
-        for cam in self.cameras.values():
-            cam.connect()
 
         self.configure()
         logger.info(f"{self} connected.")

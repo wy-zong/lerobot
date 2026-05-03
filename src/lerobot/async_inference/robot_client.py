@@ -93,7 +93,6 @@ class RobotClient:
         # Store configuration
         self.config = config
         self.robot = make_robot_from_config(config.robot)
-        self.robot.connect()
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -130,8 +129,6 @@ class RobotClient:
         # FPS measurement
         self.fps_tracker = FPSTracker(target_fps=self.config.fps)
 
-        self.logger.info("Robot connected and ready")
-
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
@@ -161,6 +158,9 @@ class RobotClient:
             )
 
             self.stub.SendPolicyInstructions(policy_setup)
+
+            self.robot.connect()
+            self.logger.info("Robot connected and ready")
 
             self.shutdown_event.clear()
 

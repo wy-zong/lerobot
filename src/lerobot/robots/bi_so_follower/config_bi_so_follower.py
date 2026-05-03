@@ -14,7 +14,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+from lerobot.cameras import CameraConfig
 
 from ..config import RobotConfig
 from ..so_follower import SOFollowerConfig
@@ -27,3 +29,4 @@ class BiSOFollowerConfig(RobotConfig):
 
     left_arm_config: SOFollowerConfig
     right_arm_config: SOFollowerConfig
+    cameras: dict[str, CameraConfig] = field(default_factory=dict)

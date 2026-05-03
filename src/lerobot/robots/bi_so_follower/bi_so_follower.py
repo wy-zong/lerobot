@@ -17,6 +17,7 @@
 import logging
 from functools import cached_property
 
+from lerobot.cameras import make_cameras_from_configs
 from lerobot.types import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -38,6 +39,7 @@ class BiSOFollower(Robot):
     def __init__(self, config: BiSOFollowerConfig):
         super().__init__(config)
         self.config = config
+        self._use_top_level_cameras = bool(config.cameras)
 
         left_arm_config = SOFollowerRobotConfig(
             id=f"{config.id}_left" if config.id else None,
@@ -46,7 +48,7 @@ class BiSOFollower(Robot):
             disable_torque_on_disconnect=config.left_arm_config.disable_torque_on_disconnect,
             max_relative_target=config.left_arm_config.max_relative_target,
             use_degrees=config.left_arm_config.use_degrees,
-            cameras=config.left_arm_config.cameras,
+            cameras={} if self._use_top_level_cameras else config.left_arm_config.cameras,
         )
 
         right_arm_config = SOFollowerRobotConfig(
@@ -56,14 +58,17 @@ class BiSOFollower(Robot):
             disable_torque_on_disconnect=config.right_arm_config.disable_torque_on_disconnect,
             max_relative_target=config.right_arm_config.max_relative_target,
             use_degrees=config.right_arm_config.use_degrees,
-            cameras=config.right_arm_config.cameras,
+            cameras={} if self._use_top_level_cameras else config.right_arm_config.cameras,
         )
 
         self.left_arm = SOFollower(left_arm_config)
         self.right_arm = SOFollower(right_arm_config)
 
-        # Only for compatibility with other parts of the codebase that expect a `robot.cameras` attribute
-        self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
+        if self._use_top_level_cameras:
+            self.cameras = make_cameras_from_configs(config.cameras)
+        else:
+            # Only for compatibility with other parts of the codebase that expect a `robot.cameras` attribute
+            self.cameras = {**self.left_arm.cameras, **self.right_arm.cameras}
 
     @property
     def _motors_ft(self) -> dict[str, type]:
@@ -77,6 +82,12 @@ class BiSOFollower(Robot):
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
+        if self._use_top_level_cameras:
+            return {
+                cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3)
+                for cam in self.cameras
+            }
+
         left_arm_cameras_ft = self.left_arm._cameras_ft
         right_arm_cameras_ft = self.right_arm._cameras_ft
 
@@ -95,10 +106,17 @@ class BiSOFollower(Robot):
 
     @property
     def is_connected(self) -> bool:
-        return self.left_arm.is_connected and self.right_arm.is_connected
+        return (
+            self.left_arm.is_connected
+            and self.right_arm.is_connected
+            and all(cam.is_connected for cam in self.cameras.values())
+        )
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
+        if self._use_top_level_cameras:
+            for cam in self.cameras.values():
+                cam.connect()
         self.left_arm.connect(calibrate)
         self.right_arm.connect(calibrate)
 
@@ -130,6 +148,10 @@ class BiSOFollower(Robot):
         right_obs = self.right_arm.get_observation()
         obs_dict.update({f"right_{key}": value for key, value in right_obs.items()})
 
+        if self._use_top_level_cameras:
+            for cam_key, cam in self.cameras.items():
+                obs_dict[cam_key] = cam.read_latest()
+
         return obs_dict
 
     @check_if_not_connected
@@ -156,3 +178,6 @@ class BiSOFollower(Robot):
     def disconnect(self):
         self.left_arm.disconnect()
         self.right_arm.disconnect()
+        if self._use_top_level_cameras:
+            for cam in self.cameras.values():
+                cam.disconnect()

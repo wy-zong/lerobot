@@ -39,10 +39,9 @@ lerobot-teleoperate \
   --robot.left_arm_config.port=/dev/tty.usbmodem5A460822851 \
   --robot.right_arm_config.port=/dev/tty.usbmodem5A460814411 \
   --robot.id=bimanual_follower \
-  --robot.left_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
-  }' --robot.right_arm_config.cameras='{
-    wrist: {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
+  --robot.cameras='{
+    "left_wrist": {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 30},
+    "right_wrist": {"type": "opencv", "index_or_path": 2, "width": 640, "height": 480, "fps": 30},
   }' \
   --teleop.type=bi_so_leader \
   --teleop.left_arm_config.port=/dev/tty.usbmodem5A460852721 \

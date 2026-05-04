@@ -14,8 +14,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from __future__ import annotations
-
 import logging
 import threading
 from concurrent import futures
@@ -205,4 +203,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

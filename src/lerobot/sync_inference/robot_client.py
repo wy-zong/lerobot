@@ -133,8 +133,7 @@ class SyncRobotClient:
         reset_pipeline(self.robot_observation_processor)
         self.transport.ready()
 
-    def request_next_chunk(self) -> int:
-        raw_observation = self.robot.get_observation()
+    def request_next_chunk(self, raw_observation: RobotObservation) -> int:
         self.last_raw_observation = raw_observation
         observation = build_observation_frame(
             raw_observation=raw_observation,
@@ -157,25 +156,33 @@ class SyncRobotClient:
             ordered_action_keys=self.ordered_action_keys,
         )
 
-    def execute_next_action(self) -> RobotAction | None:
+    def execute_next_action(self, current_observation: RobotObservation) -> RobotAction | None:
         if not self.actions:
             return None
         action_tensor = self.actions.popleft()
         action = self._action_tensor_to_action_dict(action_tensor)
-        observation = self.last_raw_observation or {}
-        processed_action = self.robot_action_processor((action, observation))
+        processed_action = self.robot_action_processor((action, current_observation))
         return self.robot.send_action(processed_action)
 
-    def step(self) -> RobotAction | None:
+    def step(self) -> tuple[RobotAction | None, float]:
+        step_start = time.perf_counter()
+        should_refresh_observation = not self.actions or self.config.refresh_observation_each_step
+        current_observation = (
+            self.robot.get_observation()
+            if should_refresh_observation
+            else self.last_raw_observation or {}
+        )
+
         if not self.actions:
-            self.request_next_chunk()
-        return self.execute_next_action()
+            self.request_next_chunk(current_observation)
+
+        action = self.execute_next_action(current_observation)
+        return action, time.perf_counter() - step_start
 
     def control_loop(self) -> None:
         while self.running:
-            loop_start = time.perf_counter()
-            self.step()
-            precise_sleep(max(0.0, self.config.environment_dt - (time.perf_counter() - loop_start)))
+            _, loop_dt = self.step()
+            precise_sleep(max(0.0, self.config.environment_dt - loop_dt))
 
 
 @draccus.wrap()

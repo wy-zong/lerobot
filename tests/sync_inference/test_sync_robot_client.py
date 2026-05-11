@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 
 import pytest
@@ -37,8 +38,9 @@ from tests.mocks.mock_robot import MockRobotConfig
 
 
 class FakeTransport:
-    def __init__(self, chunks: Iterable[list[torch.Tensor]]):
+    def __init__(self, chunks: Iterable[list[torch.Tensor]], *, request_delay_s: float = 0.0):
         self.chunks = [SyncActionChunk(actions=chunk) for chunk in chunks]
+        self.request_delay_s = request_delay_s
         self.ready_calls = 0
         self.policy_config: RemotePolicyConfig | None = None
         self.requests: list[SyncObservationRequest] = []
@@ -52,6 +54,8 @@ class FakeTransport:
 
     def request_action_chunk(self, request: SyncObservationRequest) -> SyncActionChunk:
         self.requests.append(request)
+        if self.request_delay_s:
+            time.sleep(self.request_delay_s)
         return self.chunks.pop(0)
 
     def close(self) -> None:
@@ -99,6 +103,71 @@ def test_client_executes_first_action_from_new_chunk() -> None:
     assert len(transport.requests) == 1
     assert sent_actions == [{"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0}]
     assert len(client.actions) == 1
+
+
+def test_client_does_not_refresh_observation_while_chunk_has_actions_by_default() -> None:
+    client, _transport, _sent_actions = _make_client(
+        [[torch.tensor([1.0, 1.0, 1.0]), torch.tensor([2.0, 2.0, 2.0])]]
+    )
+    get_observation_calls = 0
+    original_get_observation = client.robot.get_observation
+
+    def counted_get_observation():
+        nonlocal get_observation_calls
+        get_observation_calls += 1
+        return original_get_observation()
+
+    client.robot.get_observation = counted_get_observation
+
+    try:
+        client.step()
+        client.step()
+    finally:
+        client.stop()
+
+    assert get_observation_calls == 1
+
+
+def test_client_can_refresh_observation_for_each_action_when_configured() -> None:
+    cfg = _config()
+    cfg.refresh_observation_each_step = True
+    transport = FakeTransport(
+        [[torch.tensor([1.0, 1.0, 1.0]), torch.tensor([2.0, 2.0, 2.0])]]
+    )
+    client = SyncRobotClient(cfg, transport=transport)
+    get_observation_calls = 0
+    original_get_observation = client.robot.get_observation
+
+    def counted_get_observation():
+        nonlocal get_observation_calls
+        get_observation_calls += 1
+        return original_get_observation()
+
+    client.robot.get_observation = counted_get_observation
+    client.robot.send_action = lambda action: action
+
+    assert client.start()
+    try:
+        client.step()
+        client.step()
+    finally:
+        client.stop()
+
+    assert get_observation_calls == 2
+
+
+def test_step_duration_includes_blocking_chunk_request() -> None:
+    transport = FakeTransport([[torch.tensor([1.0, 2.0, 3.0])]], request_delay_s=0.02)
+    client = SyncRobotClient(_config(), transport=transport)
+
+    client.robot.send_action = lambda action: action
+    assert client.start()
+    try:
+        _action, loop_dt = client.step()
+    finally:
+        client.stop()
+
+    assert loop_dt >= 0.015
 
 
 def test_client_requests_next_chunk_only_after_current_chunk_is_empty() -> None:

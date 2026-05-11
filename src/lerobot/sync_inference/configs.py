@@ -65,6 +65,15 @@ class RobotClientConfig:
         default_factory=dict,
         metadata={"help": "Observation feature rename map applied by the server preprocessor"},
     )
+    refresh_observation_each_step: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Refresh robot observations before every action execution. "
+                "Leave disabled for chunked VLA policies to avoid camera capture on every control tick."
+            )
+        },
+    )
 
     @property
     def environment_dt(self) -> float:
@@ -85,4 +94,3 @@ class RobotClientConfig:
             raise ValueError(f"fps must be positive, got {self.fps}")
         if self.n_action_steps is not None and self.n_action_steps <= 0:
             raise ValueError(f"n_action_steps must be positive when set, got {self.n_action_steps}")
-

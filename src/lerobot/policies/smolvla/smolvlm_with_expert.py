@@ -13,6 +13,8 @@
 # limitations under the License.
 
 import copy
+import logging
+import math
 from typing import TYPE_CHECKING
 
 import torch
@@ -34,6 +36,33 @@ else:
     AutoModelForImageTextToText = None
     AutoProcessor = None
     SmolVLMForConditionalGeneration = None
+
+
+def get_smolvlm_image_seq_len(config) -> int:
+    vision_config = config.vision_config
+    return ((vision_config.image_size // vision_config.patch_size) ** 2) // (config.scale_factor**2)
+
+
+def set_smolvlm_image_seq_len(config, image_seq_len: int) -> int:
+    vision_config = config.vision_config
+    num_patches = (vision_config.image_size // vision_config.patch_size) ** 2
+    if num_patches % image_seq_len != 0:
+        raise ValueError(
+            f"`image_seq_len={image_seq_len}` must divide the number of vision patches ({num_patches})."
+        )
+
+    scale_factor_squared = num_patches // image_seq_len
+    scale_factor = math.isqrt(scale_factor_squared)
+    if scale_factor * scale_factor != scale_factor_squared:
+        raise ValueError(
+            f"`image_seq_len={image_seq_len}` requires a non-integer SmolVLM scale factor "
+            f"for {num_patches} vision patches."
+        )
+
+    config.scale_factor = scale_factor
+    if hasattr(config.text_config, "pixel_shuffle_factor"):
+        config.text_config.pixel_shuffle_factor = scale_factor
+    return scale_factor
 
 
 def apply_rope(x, positions, max_wavelength=10_000):
@@ -81,22 +110,36 @@ class SmolVLMWithExpertModel(nn.Module):
         num_vlm_layers: int = -1,
         self_attn_every_n_layers: int = -1,
         expert_width_multiplier: float = 0.5,
+        image_seq_len: int | None = None,
         device: str = "auto",
     ):
         super().__init__()
         require_package("transformers", extra="smolvla")
+        config = AutoConfig.from_pretrained(model_id)
+        default_image_seq_len = get_smolvlm_image_seq_len(config)
+        image_seq_len_changed = image_seq_len is not None and image_seq_len != default_image_seq_len
+        if image_seq_len_changed:
+            scale_factor = set_smolvlm_image_seq_len(config, image_seq_len)
+            logging.info(
+                "Using SmolVLM image_seq_len=%s (scale_factor=%s) instead of backbone default %s.",
+                image_seq_len,
+                scale_factor,
+                default_image_seq_len,
+            )
         if load_vlm_weights:
             print(f"Loading  {model_id} weights ...")
             self.vlm = AutoModelForImageTextToText.from_pretrained(
                 model_id,
+                config=config,
                 torch_dtype="bfloat16",
                 low_cpu_mem_usage=True,
+                ignore_mismatched_sizes=image_seq_len_changed,
             )
-            config = self.vlm.config
         else:
-            config = AutoConfig.from_pretrained(model_id)
             self.vlm = SmolVLMForConditionalGeneration(config=config)
         self.processor = AutoProcessor.from_pretrained(model_id)
+        if hasattr(self.processor, "image_seq_len"):
+            self.processor.image_seq_len = get_smolvlm_image_seq_len(config)
         if num_vlm_layers > 0:
             print(f"Reducing the number of VLM layers to {num_vlm_layers} ...")
             self.get_vlm_model().text_model.layers = self.get_vlm_model().text_model.layers[:num_vlm_layers]

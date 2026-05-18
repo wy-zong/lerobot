@@ -43,6 +43,10 @@ class SmolVLAConfig(PreTrainedConfig):
 
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
+    # Number of image tokens produced by the SmolVLM connector per camera.
+    # Leave unset to use the VLM backbone default. For SmolVLM2-500M,
+    # 256 corresponds to scale_factor=2 instead of the default scale_factor=4.
+    image_seq_len: int | None = None
 
     # Add empty images. Used by smolvla_aloha_sim which adds the empty
     # left and right wrist cameras in addition to the top camera.
@@ -119,6 +123,8 @@ class SmolVLAConfig(PreTrainedConfig):
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."
             )
+        if self.image_seq_len is not None and self.image_seq_len <= 0:
+            raise ValueError(f"`image_seq_len` must be positive when set. Got {self.image_seq_len}.")
 
     def validate_features(self) -> None:
         for i in range(self.empty_cameras):

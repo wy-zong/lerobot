@@ -52,12 +52,14 @@ policy = SmolVLAPolicy.from_pretrained("lerobot/smolvla_base")
 
 """
 
+import logging
 import math
 from collections import deque
 from typing import TypedDict, Unpack
 
 import torch
 import torch.nn.functional as F  # noqa: N812
+from safetensors.torch import load_file
 from torch import Tensor, nn
 
 from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
@@ -67,6 +69,7 @@ from lerobot.utils.import_utils import require_package
 from ..pretrained import PreTrainedPolicy
 from ..rtc.modeling_rtc import RTCProcessor
 from ..utils import (
+    log_model_loading_keys,
     populate_queues,
 )
 from .configuration_smolvla import SmolVLAConfig
@@ -247,6 +250,35 @@ class SmolVLAPolicy(PreTrainedPolicy):
         self.init_rtc_processor()
         self.model = VLAFlowMatching(config, rtc_processor=self.rtc_processor)
         self.reset()
+
+    @classmethod
+    def _load_as_safetensor(cls, model, model_file: str, map_location: str, strict: bool):
+        if strict:
+            return super()._load_as_safetensor(model, model_file, map_location, strict)
+
+        state_dict = load_file(model_file, device=map_location)
+        model_state_dict = model.state_dict()
+        compatible_state_dict = {}
+        skipped_keys = []
+        for key, value in state_dict.items():
+            if key in model_state_dict and model_state_dict[key].shape != value.shape:
+                skipped_keys.append((key, tuple(value.shape), tuple(model_state_dict[key].shape)))
+                continue
+            compatible_state_dict[key] = value
+
+        missing_keys, unexpected_keys = model.load_state_dict(compatible_state_dict, strict=False)
+        if skipped_keys:
+            skipped_preview = ", ".join(
+                f"{key} checkpoint{checkpoint_shape}->model{model_shape}"
+                for key, checkpoint_shape, model_shape in skipped_keys[:8]
+            )
+            logging.warning(
+                "Skipped %s checkpoint tensor(s) with incompatible shapes while loading SmolVLA: %s",
+                len(skipped_keys),
+                skipped_preview,
+            )
+        log_model_loading_keys(missing_keys, unexpected_keys)
+        return model
 
     def reset(self):
         """This should be called whenever the environment is reset."""
@@ -578,6 +610,7 @@ class VLAFlowMatching(nn.Module):
             num_vlm_layers=self.config.num_vlm_layers,
             self_attn_every_n_layers=self.config.self_attn_every_n_layers,
             expert_width_multiplier=self.config.expert_width_multiplier,
+            image_seq_len=self.config.image_seq_len,
             device=self.config.device if self.config.device is not None else "auto",
         )
         self.state_proj = nn.Linear(

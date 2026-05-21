@@ -31,6 +31,7 @@ from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     PolicyProcessorPipeline,
     RelativeActionsProcessorStep,
+    RenameObservationsProcessorStep,
     batch_to_transition,
     policy_action_to_transition,
     transition_to_batch,
@@ -77,6 +78,35 @@ def _reconnect_relative_absolute_steps(
     for step in postprocessor.steps:
         if isinstance(step, AbsoluteActionsProcessorStep) and step.relative_step is None:
             step.relative_step = relative_step
+
+
+def _without_state_features(features: dict[str, Any] | None) -> dict[str, Any]:
+    if not features:
+        return {}
+    filtered = {}
+    for key, feature in features.items():
+        feature_type = feature.get("type") if isinstance(feature, dict) else feature.type
+        if feature_type in (FeatureType.STATE, FeatureType.STATE.value):
+            continue
+        filtered[key] = feature
+    return filtered
+
+
+def _ensure_smolvla_no_state_preprocessor(
+    policy_cfg: PreTrainedConfig, preprocessor: PolicyProcessorPipeline
+) -> None:
+    if not isinstance(policy_cfg, SmolVLAConfig) or policy_cfg.use_state:
+        return
+
+    from .smolvla.processor_smolvla import DropStateProcessorStep
+
+    if any(isinstance(step, DropStateProcessorStep) for step in preprocessor.steps):
+        return
+
+    steps = list(preprocessor.steps)
+    insert_at = 1 if steps and isinstance(steps[0], RenameObservationsProcessorStep) else 0
+    steps.insert(insert_at, DropStateProcessorStep())
+    preprocessor.steps = steps
 
 
 def get_policy_class(name: str) -> type[PreTrainedPolicy]:
@@ -264,6 +294,19 @@ def make_pre_post_processors(
             policy configuration type.
     """
     if pretrained_path:
+        if isinstance(policy_cfg, SmolVLAConfig):
+            importlib.import_module("lerobot.policies.smolvla.processor_smolvla")
+            if not policy_cfg.use_state:
+                preprocessor_overrides = dict(kwargs.get("preprocessor_overrides", {}) or {})
+                normalizer_overrides = dict(preprocessor_overrides.get("normalizer_processor", {}) or {})
+                normalizer_overrides["features"] = {
+                    **_without_state_features(policy_cfg.input_features),
+                    **(policy_cfg.output_features or {}),
+                }
+                normalizer_overrides.setdefault("norm_map", policy_cfg.normalization_mapping)
+                preprocessor_overrides["normalizer_processor"] = normalizer_overrides
+                kwargs["preprocessor_overrides"] = preprocessor_overrides
+
         # TODO(Steven): Temporary patch, implement correctly the processors for Gr00t
         if isinstance(policy_cfg, GrootConfig):
             # GROOT handles normalization in groot_pack_inputs_v3 step
@@ -294,6 +337,7 @@ def make_pre_post_processors(
             to_transition=batch_to_transition,
             to_output=transition_to_batch,
         )
+        _ensure_smolvla_no_state_preprocessor(policy_cfg, preprocessor)
         postprocessor = PolicyProcessorPipeline.from_pretrained(
             pretrained_model_name_or_path=pretrained_path,
             config_filename=kwargs.get(

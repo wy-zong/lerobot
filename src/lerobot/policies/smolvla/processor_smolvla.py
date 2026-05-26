@@ -21,6 +21,7 @@ import torch
 
 from lerobot.configs import FeatureType, PipelineFeatureType, PolicyFeature
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     NewLineTaskProcessorStep,
@@ -28,7 +29,9 @@ from lerobot.processor import (
     ObservationProcessorStep,
     PolicyAction,
     PolicyProcessorPipeline,
+    ProcessorStep,
     ProcessorStepRegistry,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TokenizerProcessorStep,
     UnnormalizerProcessorStep,
@@ -87,15 +90,17 @@ def make_smolvla_pre_post_processors(
 
     The pre-processing pipeline prepares input data for the model by:
     1.  Renaming features to match pretrained configurations.
-    2.  Normalizing input and output features based on dataset statistics.
-    3.  Adding a batch dimension.
-    4.  Ensuring the language task description ends with a newline character.
-    5.  Tokenizing the language task description.
-    6.  Moving all data to the specified device.
+    2.  Adding a batch dimension.
+    3.  Ensuring the language task description ends with a newline character.
+    4.  Tokenizing the language task description.
+    5.  Moving all data to the specified device.
+    6.  Optionally converting absolute actions to relative actions.
+    7.  Normalizing input and output features based on dataset statistics.
 
     The post-processing pipeline handles the model's output by:
-    1.  Moving data to the CPU.
-    2.  Unnormalizing the output actions to their original scale.
+    1.  Unnormalizing the output actions to their original scale.
+    2.  Optionally converting relative actions back to absolute actions.
+    3.  Moving data to the CPU.
 
     Args:
         config: The configuration object for the SmolVLA policy.
@@ -107,10 +112,18 @@ def make_smolvla_pre_post_processors(
 
     input_features = config.input_features or {}
     output_features = config.output_features or {}
+    if config.use_relative_actions and not config.use_state:
+        raise ValueError("`use_relative_actions=true` requires `use_state=true` for SmolVLA.")
     if not config.use_state:
         input_features = _without_state_features(input_features)
 
-    input_steps = [
+    relative_step = RelativeActionsProcessorStep(
+        enabled=config.use_relative_actions,
+        exclude_joints=getattr(config, "relative_exclude_joints", []),
+        action_names=getattr(config, "action_feature_names", None),
+    )
+
+    input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
     ]
     if not config.use_state:
@@ -126,6 +139,7 @@ def make_smolvla_pre_post_processors(
                 max_length=config.tokenizer_max_length,
             ),
             DeviceProcessorStep(device=config.device),
+            relative_step,
             NormalizerProcessorStep(
                 features={**input_features, **output_features},
                 norm_map=config.normalization_mapping,
@@ -137,6 +151,7 @@ def make_smolvla_pre_post_processors(
         UnnormalizerProcessorStep(
             features=output_features, norm_map=config.normalization_mapping, stats=dataset_stats
         ),
+        AbsoluteActionsProcessorStep(enabled=config.use_relative_actions, relative_step=relative_step),
         DeviceProcessorStep(device="cpu"),
     ]
     return (

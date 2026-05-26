@@ -24,12 +24,14 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatur
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
 from lerobot.processor import (
+    AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
     DeviceProcessorStep,
     EnvTransition,
     NewLineTaskProcessorStep,
     NormalizerProcessorStep,
     ProcessorStep,
+    RelativeActionsProcessorStep,
     RenameObservationsProcessorStep,
     TransitionKey,
     UnnormalizerProcessorStep,
@@ -103,18 +105,192 @@ def test_make_smolvla_processor_basic():
     assert postprocessor.name == "policy_postprocessor"
 
     # Check steps in preprocessor
-    assert len(preprocessor.steps) == 6
+    assert len(preprocessor.steps) == 7
     assert isinstance(preprocessor.steps[0], RenameObservationsProcessorStep)
     assert isinstance(preprocessor.steps[1], AddBatchDimensionProcessorStep)
     assert isinstance(preprocessor.steps[2], NewLineTaskProcessorStep)
     # Step 3 would be TokenizerProcessorStep but it's mocked
     assert isinstance(preprocessor.steps[4], DeviceProcessorStep)
-    assert isinstance(preprocessor.steps[5], NormalizerProcessorStep)
+    assert isinstance(preprocessor.steps[5], RelativeActionsProcessorStep)
+    assert not preprocessor.steps[5].enabled
+    assert isinstance(preprocessor.steps[6], NormalizerProcessorStep)
 
     # Check steps in postprocessor
-    assert len(postprocessor.steps) == 2
+    assert len(postprocessor.steps) == 3
     assert isinstance(postprocessor.steps[0], UnnormalizerProcessorStep)
-    assert isinstance(postprocessor.steps[1], DeviceProcessorStep)
+    assert isinstance(postprocessor.steps[1], AbsoluteActionsProcessorStep)
+    assert not postprocessor.steps[1].enabled
+    assert postprocessor.steps[1].relative_step is preprocessor.steps[5]
+    assert isinstance(postprocessor.steps[2], DeviceProcessorStep)
+
+
+def test_smolvla_relative_actions_processor_pairing():
+    """Relative action mode wires paired pre/post processor steps in the correct order."""
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.action_feature_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+        "gripper",
+    ]
+    stats = create_default_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    relative_step = next(
+        step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)
+    )
+    absolute_step = next(
+        step for step in postprocessor.steps if isinstance(step, AbsoluteActionsProcessorStep)
+    )
+    normalizer_step = next(step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep))
+    unnormalizer_step = next(
+        step for step in postprocessor.steps if isinstance(step, UnnormalizerProcessorStep)
+    )
+
+    assert relative_step.enabled
+    assert relative_step.exclude_joints == ["gripper"]
+    assert relative_step.action_names == config.action_feature_names
+    assert preprocessor.steps.index(relative_step) < preprocessor.steps.index(normalizer_step)
+    assert absolute_step.enabled
+    assert absolute_step.relative_step is relative_step
+    assert postprocessor.steps.index(unnormalizer_step) < postprocessor.steps.index(absolute_step)
+
+
+def test_smolvla_relative_actions_roundtrip_excludes_gripper():
+    """SmolVLA converts joint dims to relative actions while excluded gripper stays absolute."""
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+    config.action_feature_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+        "gripper",
+    ]
+    stats = create_default_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    state = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.25, 99.0])
+    action = torch.tensor(
+        [
+            [1.5, 1.5, 3.25, 3.75, 5.5, 5.0, 0.75],
+            [0.5, 2.5, 2.75, 4.25, 4.5, 6.5, 0.50],
+        ]
+    )
+    observation = {
+        OBS_STATE: state,
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(observation, action, complementary_data={"task": "relative action test"})
+    processed = preprocessor(transition_to_batch(transition))
+
+    expected_relative = action.clone()
+    expected_relative[..., :6] -= state[:6].view(1, 6)
+    torch.testing.assert_close(processed[ACTION], expected_relative)
+    torch.testing.assert_close(processed[ACTION][..., 6], action[..., 6])
+
+    postprocessed = postprocessor(processed[ACTION])
+    torch.testing.assert_close(postprocessed, action)
+
+
+def test_smolvla_relative_actions_disabled_keeps_absolute_action_flow():
+    config = create_default_config()
+    config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+    stats = create_default_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    state = torch.arange(8, dtype=torch.float32) * 10
+    action = torch.tensor(
+        [
+            [0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70],
+            [-0.10, -0.20, -0.30, -0.40, -0.50, -0.60, -0.70],
+        ]
+    )
+    observation = {
+        OBS_STATE: state,
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(observation, action, complementary_data={"task": "absolute action test"})
+    processed = preprocessor(transition_to_batch(transition))
+
+    torch.testing.assert_close(processed[ACTION], action)
+    torch.testing.assert_close(postprocessor(processed[ACTION]), action)
+
+
+def test_smolvla_relative_actions_cache_state_without_actions():
+    """Inference preprocessing caches observation.state so predicted relative chunks become absolute."""
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+    config.action_feature_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+        "gripper",
+    ]
+    stats = create_default_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    state = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.25, 99.0])
+    observation = {
+        OBS_STATE: state,
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(observation, complementary_data={"task": "inference cache test"})
+    preprocessor(transition_to_batch(transition))
+
+    predicted_relative = torch.tensor(
+        [
+            [
+                [0.5, -0.5, 0.25, -0.25, 0.5, -1.0, 0.75],
+                [-0.5, 0.5, -0.25, 0.25, -0.5, 0.5, 0.50],
+            ]
+        ]
+    )
+    postprocessed = postprocessor(predicted_relative)
+
+    expected_absolute = predicted_relative.clone()
+    expected_absolute[..., :6] += state[:6].view(1, 1, 6)
+    torch.testing.assert_close(postprocessed, expected_absolute)
+    torch.testing.assert_close(postprocessed[..., 6], predicted_relative[..., 6])
+
+
+def test_smolvla_relative_actions_requires_state():
+    with pytest.raises(ValueError, match="use_relative_actions=true.*use_state=true"):
+        SmolVLAConfig(use_relative_actions=True, use_state=False)
+
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.use_state = False
+
+    with pytest.raises(ValueError, match="use_relative_actions=true.*use_state=true"):
+        make_smolvla_pre_post_processors(config, create_default_stats())
 
 
 def test_smolvla_newline_processor_single_task():
@@ -425,8 +601,8 @@ def test_smolvla_processor_bfloat16_device_float32_normalizer():
             modified_steps.append(step)
     preprocessor.steps = modified_steps
 
-    # Verify initial normalizer configuration (SmolVLA has NormalizerProcessorStep at index 5)
-    normalizer_step = preprocessor.steps[5]  # NormalizerProcessorStep
+    # Verify initial normalizer configuration (SmolVLA has NormalizerProcessorStep at index 6)
+    normalizer_step = preprocessor.steps[6]  # NormalizerProcessorStep
     assert normalizer_step.dtype == torch.float32
 
     # Create test data with both state and visual observations

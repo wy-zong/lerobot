@@ -43,6 +43,13 @@ class SmolVLAConfig(PreTrainedConfig):
     # Whether to condition SmolVLA on observation.state.
     use_state: bool = True
 
+    # Relative actions: converts absolute actions to relative (relative to state).
+    use_relative_actions: bool = False
+    # Joint names to exclude from relative (kept absolute). Empty list = all dims relative.
+    relative_exclude_joints: list[str] = field(default_factory=lambda: ["gripper"])
+    # Populated at runtime from dataset metadata by make_policy.
+    action_feature_names: list[str] | None = None
+
     # Image preprocessing
     resize_imgs_with_padding: tuple[int, int] = (512, 512)
     # Number of image tokens produced by the SmolVLM connector per camera.
@@ -121,6 +128,8 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
+        if self.use_relative_actions and not self.use_state:
+            raise ValueError("`use_relative_actions=true` requires `use_state=true` for SmolVLA.")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

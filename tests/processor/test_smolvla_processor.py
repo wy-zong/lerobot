@@ -208,6 +208,45 @@ def test_smolvla_relative_actions_roundtrip_excludes_gripper():
     torch.testing.assert_close(postprocessed, action)
 
 
+def test_smolvla_relative_actions_training_batch_uses_latest_state_frame():
+    config = create_default_config()
+    config.use_relative_actions = True
+    config.input_features[OBS_STATE] = PolicyFeature(type=FeatureType.STATE, shape=(12,))
+    config.output_features[ACTION] = PolicyFeature(type=FeatureType.ACTION, shape=(12,))
+    config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+    config.action_feature_names = [f"joint_{i}" for i in range(11)] + ["gripper"]
+    stats = {
+        OBS_STATE: {"mean": torch.zeros(12), "std": torch.ones(12)},
+        OBS_IMAGE: {},
+        ACTION: {"min": torch.full((12,), -1.0), "max": torch.ones(12)},
+    }
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    batch_size = 12
+    chunk_size = 50
+    latest_state = torch.randn(batch_size, 12)
+    batch = {
+        OBS_STATE: latest_state.unsqueeze(1),
+        OBS_IMAGE: torch.randn(batch_size, 1, 3, 224, 224),
+        ACTION: torch.randn(batch_size, chunk_size, 12),
+        "task": ["training batch shape test"] * batch_size,
+    }
+
+    processed = preprocessor(batch)
+
+    expected_relative = batch[ACTION].clone()
+    expected_relative[..., :11] -= latest_state[:, None, :11]
+    torch.testing.assert_close(processed[ACTION], expected_relative)
+    torch.testing.assert_close(processed[ACTION][..., 11], batch[ACTION][..., 11])
+
+    postprocessed = postprocessor(processed[ACTION])
+    torch.testing.assert_close(postprocessed, batch[ACTION])
+
+
 def test_smolvla_relative_actions_disabled_keeps_absolute_action_flow():
     config = create_default_config()
     config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY

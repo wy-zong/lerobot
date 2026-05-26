@@ -42,16 +42,12 @@ def to_relative_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
-        state: (B, state_dim). Broadcast across time dimension.
+        state: (B, state_dim) or (B, n_obs_steps, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
     dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    state_offset = _state_offset_for_actions(actions, state, mask_t, dims)
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
@@ -64,21 +60,33 @@ def to_absolute_actions(actions: Tensor, state: Tensor, mask: Sequence[bool]) ->
 
     Args:
         actions: (B, T, action_dim) or (B, action_dim).
-        state: (B, state_dim). Broadcast across time dimension.
+        state: (B, state_dim) or (B, n_obs_steps, state_dim). Broadcast across time dimension.
         mask: Which dims to convert. Can be shorter than action_dim.
     """
     mask_t = torch.tensor(mask, dtype=actions.dtype, device=actions.device)
     dims = mask_t.shape[0]
-    # Align state to the same device/dtype as actions. _last_state is cached before
-    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
-    if state.device != actions.device or state.dtype != actions.dtype:
-        state = state.to(device=actions.device, dtype=actions.dtype)
-    state_offset = state[..., :dims] * mask_t
+    state_offset = _state_offset_for_actions(actions, state, mask_t, dims)
     if actions.ndim == 3:
         state_offset = state_offset.unsqueeze(-2)
     actions = actions.clone()
     actions[..., :dims] += state_offset
     return actions
+
+
+def _state_offset_for_actions(actions: Tensor, state: Tensor, mask_t: Tensor, dims: int) -> Tensor:
+    """Return the current-state offset with a shape broadcastable to ``actions[..., :dims]``."""
+    # Align state to the same device/dtype as actions. _last_state is cached before
+    # DeviceProcessorStep moves the transition, so it can be on CPU while actions are on CUDA.
+    if state.device != actions.device or state.dtype != actions.dtype:
+        state = state.to(device=actions.device, dtype=actions.dtype)
+
+    if actions.ndim >= 2:
+        target_state_ndim = actions.ndim - 1 if actions.ndim >= 3 else actions.ndim
+        while state.ndim > target_state_ndim:
+            state = state.select(dim=-2, index=state.shape[-2] - 1)
+
+    state_offset = state[..., :dims] * mask_t
+    return state_offset
 
 
 @ProcessorStepRegistry.register("delta_actions_processor")

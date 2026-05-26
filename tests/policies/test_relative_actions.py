@@ -78,6 +78,21 @@ def test_roundtrip_3d(action_dim):
     torch.testing.assert_close(recovered, actions)
 
 
+def test_roundtrip_3d_with_observation_history_state(action_dim):
+    actions = torch.randn(4, CHUNK_SIZE, action_dim)
+    latest_state = torch.randn(4, action_dim)
+    previous_state = latest_state + 10.0
+    state = torch.stack([previous_state, latest_state], dim=1)
+    mask = [True] * action_dim
+
+    relative = to_relative_actions(actions, state, mask)
+    expected_relative = actions - latest_state.unsqueeze(1)
+    torch.testing.assert_close(relative, expected_relative)
+
+    recovered = to_absolute_actions(relative, state, mask)
+    torch.testing.assert_close(recovered, actions)
+
+
 def test_roundtrip_2d(action_dim):
     actions = torch.randn(4, action_dim)
     state = torch.randn(4, action_dim)

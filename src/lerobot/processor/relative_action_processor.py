@@ -143,8 +143,12 @@ class RelativeActionsProcessorStep(ProcessorStep):
 
         new_transition = transition.copy()
         action = new_transition.get(TransitionKey.ACTION)
-        if action is None or state is None:
+        if action is None:
             return new_transition
+        if state is None:
+            raise ValueError(
+                f"RelativeActionsProcessorStep requires `{OBS_STATE}` to convert actions to relative actions."
+            )
 
         mask = self._build_mask(action.shape[-1])
         new_transition[TransitionKey.ACTION] = to_relative_actions(action, state, mask)

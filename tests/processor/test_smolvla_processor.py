@@ -22,7 +22,10 @@ import torch
 
 from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatureType, PolicyFeature
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
-from lerobot.policies.smolvla.processor_smolvla import make_smolvla_pre_post_processors
+from lerobot.policies.smolvla.processor_smolvla import (
+    DropStateProcessorStep,
+    make_smolvla_pre_post_processors,
+)
 from lerobot.processor import (
     AbsoluteActionsProcessorStep,
     AddBatchDimensionProcessorStep,
@@ -275,6 +278,14 @@ def test_smolvla_relative_actions_disabled_keeps_absolute_action_flow():
     torch.testing.assert_close(postprocessor(processed[ACTION]), action)
 
 
+def test_relative_actions_enabled_requires_state_for_action_conversion():
+    """Relative action conversion should not silently train on absolute actions."""
+    transition = create_transition(action=torch.randn(2, 7))
+
+    with pytest.raises(ValueError, match="requires `observation.state`"):
+        RelativeActionsProcessorStep(enabled=True)(transition)
+
+
 def test_smolvla_relative_actions_cache_state_without_actions():
     """Inference preprocessing caches observation.state so predicted relative chunks become absolute."""
     config = create_default_config()
@@ -320,16 +331,58 @@ def test_smolvla_relative_actions_cache_state_without_actions():
     torch.testing.assert_close(postprocessed[..., 6], predicted_relative[..., 6])
 
 
-def test_smolvla_relative_actions_requires_state():
-    with pytest.raises(ValueError, match="use_relative_actions=true.*use_state=true"):
-        SmolVLAConfig(use_relative_actions=True, use_state=False)
-
+def test_smolvla_relative_actions_can_train_without_state_input():
     config = create_default_config()
     config.use_relative_actions = True
     config.use_state = False
+    config.normalization_mapping[FeatureType.ACTION] = NormalizationMode.IDENTITY
+    config.action_feature_names = [
+        "shoulder_pan",
+        "shoulder_lift",
+        "elbow",
+        "wrist_1",
+        "wrist_2",
+        "wrist_3",
+        "gripper",
+    ]
 
-    with pytest.raises(ValueError, match="use_relative_actions=true.*use_state=true"):
-        make_smolvla_pre_post_processors(config, create_default_stats())
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, create_default_stats())
+
+    relative_step = next(
+        step for step in preprocessor.steps if isinstance(step, RelativeActionsProcessorStep)
+    )
+    drop_state_step = next(step for step in preprocessor.steps if isinstance(step, DropStateProcessorStep))
+    normalizer_step = next(step for step in preprocessor.steps if isinstance(step, NormalizerProcessorStep))
+    assert preprocessor.steps.index(relative_step) < preprocessor.steps.index(drop_state_step)
+    assert preprocessor.steps.index(drop_state_step) < preprocessor.steps.index(normalizer_step)
+
+    state = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.25, 99.0])
+    action = torch.tensor(
+        [
+            [1.5, 1.5, 3.25, 3.75, 5.5, 5.0, 0.75],
+            [0.5, 2.5, 2.75, 4.25, 4.5, 6.5, 0.50],
+        ]
+    )
+    observation = {
+        OBS_STATE: state,
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(
+        observation,
+        action,
+        complementary_data={"task": "relative action without state input"},
+    )
+
+    processed = preprocessor(transition_to_batch(transition))
+
+    expected_relative = action.clone()
+    expected_relative[..., :6] -= state[:6].view(1, 6)
+    assert OBS_STATE not in processed
+    torch.testing.assert_close(processed[ACTION], expected_relative)
+    torch.testing.assert_close(postprocessor(processed[ACTION]), action)
 
 
 def test_smolvla_newline_processor_single_task():

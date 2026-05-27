@@ -95,7 +95,8 @@ def make_smolvla_pre_post_processors(
     4.  Tokenizing the language task description.
     5.  Moving all data to the specified device.
     6.  Optionally converting absolute actions to relative actions.
-    7.  Normalizing input and output features based on dataset statistics.
+    7.  Optionally removing state from the model inputs.
+    8.  Normalizing input and output features based on dataset statistics.
 
     The post-processing pipeline handles the model's output by:
     1.  Unnormalizing the output actions to their original scale.
@@ -112,8 +113,6 @@ def make_smolvla_pre_post_processors(
 
     input_features = config.input_features or {}
     output_features = config.output_features or {}
-    if config.use_relative_actions and not config.use_state:
-        raise ValueError("`use_relative_actions=true` requires `use_state=true` for SmolVLA.")
     if not config.use_state:
         input_features = _without_state_features(input_features)
 
@@ -126,8 +125,6 @@ def make_smolvla_pre_post_processors(
     input_steps: list[ProcessorStep] = [
         RenameObservationsProcessorStep(rename_map={}),  # To mimic the same processor as pretrained one
     ]
-    if not config.use_state:
-        input_steps.append(DropStateProcessorStep())
     input_steps.extend(
         [
             AddBatchDimensionProcessorStep(),
@@ -140,12 +137,16 @@ def make_smolvla_pre_post_processors(
             ),
             DeviceProcessorStep(device=config.device),
             relative_step,
-            NormalizerProcessorStep(
-                features={**input_features, **output_features},
-                norm_map=config.normalization_mapping,
-                stats=dataset_stats,
-            ),
         ]
+    )
+    if not config.use_state:
+        input_steps.append(DropStateProcessorStep())
+    input_steps.append(
+        NormalizerProcessorStep(
+            features={**input_features, **output_features},
+            norm_map=config.normalization_mapping,
+            stats=dataset_stats,
+        )
     )
     output_steps = [
         UnnormalizerProcessorStep(

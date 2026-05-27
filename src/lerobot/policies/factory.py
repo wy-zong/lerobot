@@ -100,11 +100,14 @@ def _ensure_smolvla_no_state_preprocessor(
 
     from .smolvla.processor_smolvla import DropStateProcessorStep
 
-    if any(isinstance(step, DropStateProcessorStep) for step in preprocessor.steps):
-        return
-
-    steps = list(preprocessor.steps)
-    insert_at = 1 if steps and isinstance(steps[0], RenameObservationsProcessorStep) else 0
+    steps = [step for step in preprocessor.steps if not isinstance(step, DropStateProcessorStep)]
+    relative_indices = [
+        index for index, step in enumerate(steps) if isinstance(step, RelativeActionsProcessorStep)
+    ]
+    if relative_indices:
+        insert_at = relative_indices[-1] + 1
+    else:
+        insert_at = 1 if steps and isinstance(steps[0], RenameObservationsProcessorStep) else 0
     steps.insert(insert_at, DropStateProcessorStep())
     preprocessor.steps = steps
 

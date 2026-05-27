@@ -128,8 +128,6 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"The chunk size is the upper bound for the number of action steps per model invocation. Got "
                 f"{self.n_action_steps} for `n_action_steps` and {self.chunk_size} for `chunk_size`."
             )
-        if self.use_relative_actions and not self.use_state:
-            raise ValueError("`use_relative_actions=true` requires `use_state=true` for SmolVLA.")
         if self.use_delta_joint_actions_aloha:
             raise NotImplementedError(
                 "`use_delta_joint_actions_aloha` is used by smolvla for aloha real models. It is not ported yet in LeRobot."

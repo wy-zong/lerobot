@@ -16,7 +16,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
+from threading import Event
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -87,6 +89,8 @@ def test_dagger_config_defaults():
     assert cfg.num_episodes is None
     assert cfg.record_autonomous is False
     assert cfg.input_device == "keyboard"
+    assert cfg.keyboard.next_episode == "right"
+    assert cfg.keyboard.rerecord_episode == "left"
 
 
 def test_inference_config_types():
@@ -486,6 +490,92 @@ def test_safe_push_to_hub():
     ds.push_to_hub.assert_called_once_with(tags=["test"], private=False)
 
 
+class _FakeContinuousDataset:
+    def __init__(self, has_frames: bool = False):
+        self._has_frames = has_frames
+        self.add_frame_calls = 0
+        self.save_episode_calls = 0
+        self.clear_episode_buffer_calls = 0
+        self.num_episodes = 0
+
+    def has_pending_frames(self):
+        return self._has_frames
+
+    def add_frame(self, frame):
+        self.add_frame_calls += 1
+        self._has_frames = True
+        self.last_frame = frame
+
+    def save_episode(self):
+        assert self._has_frames
+        self.save_episode_calls += 1
+        self.num_episodes += 1
+        self._has_frames = False
+
+    def clear_episode_buffer(self, delete_images: bool = True):
+        self.clear_episode_buffer_calls += 1
+        self._has_frames = False
+
+
+def _make_dagger_continuous_context(dataset, shutdown_event: Event, interpolation_multiplier: int = 1):
+    from lerobot.utils.constants import ACTION, OBS_STATE
+
+    dataset_cfg = SimpleNamespace(single_task="test task", push_to_hub=False, tags=[], private=False)
+    cfg = SimpleNamespace(
+        fps=30,
+        interpolation_multiplier=interpolation_multiplier,
+        dataset=dataset_cfg,
+        task="test task",
+        play_sounds=False,
+        duration=0,
+        use_torch_compile=False,
+        display_data=False,
+        display_compressed_images=False,
+    )
+    robot = MagicMock()
+    robot.send_action = MagicMock()
+    teleop = MagicMock()
+    teleop.feedback_features = {}
+    processors = SimpleNamespace(
+        robot_observation_processor=MagicMock(side_effect=lambda obs: obs),
+        teleop_action_processor=MagicMock(side_effect=lambda transition: transition[0]),
+        robot_action_processor=MagicMock(side_effect=lambda transition: transition[0]),
+    )
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=shutdown_event),
+        hardware=SimpleNamespace(robot_wrapper=robot, teleop=teleop),
+        data=SimpleNamespace(
+            dataset=dataset,
+            dataset_features={
+                OBS_STATE: {"dtype": "float32", "shape": (1,), "names": ["x"]},
+                ACTION: {"dtype": "float32", "shape": (1,), "names": ["x"]},
+            },
+        ),
+        processors=processors,
+    )
+    return ctx, robot
+
+
+def _make_dagger_continuous_strategy(monkeypatch, dataset, shutdown_event, *, interpolation_multiplier=1):
+    import lerobot.rollout.strategies.dagger as dagger_module
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+
+    monkeypatch.setattr(dagger_module, "VideoEncodingManager", lambda _dataset: contextlib.nullcontext())
+    monkeypatch.setattr(dagger_module, "precise_sleep", lambda _sleep_t: None)
+    monkeypatch.setattr(dagger_module, "log_say", lambda *args, **kwargs: None)
+    monkeypatch.setattr(dagger_module, "send_next_action", MagicMock(return_value={"x": 1.0}))
+
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True))
+    strategy._episode_duration_s = 999.0
+    strategy._engine = MagicMock()
+    strategy._interpolator = MagicMock()
+    strategy._interpolator.get_control_interval.return_value = 1.0
+    strategy._interpolator.needs_new_action.return_value = True
+    ctx, robot = _make_dagger_continuous_context(dataset, shutdown_event, interpolation_multiplier)
+    return strategy, ctx, robot
+
+
 # ---------------------------------------------------------------------------
 # DAgger state machine
 # ---------------------------------------------------------------------------
@@ -522,9 +612,13 @@ def test_dagger_invalid_transition_ignored():
     from lerobot.rollout.strategies import DAggerEvents, DAggerPhase
 
     events = DAggerEvents()
+    events.next_episode_requested.set()
+    events.rerecord_requested.set()
     events.request_transition("correction")  # Not valid from AUTONOMOUS
     assert events.consume_transition() is None
     assert events.phase == DAggerPhase.AUTONOMOUS
+    assert events.next_episode_requested.is_set()
+    assert events.rerecord_requested.is_set()
 
 
 def test_dagger_events_reset():
@@ -534,9 +628,100 @@ def test_dagger_events_reset():
     events.request_transition("pause_resume")
     events.consume_transition()  # -> PAUSED
     events.upload_requested.set()
+    events.next_episode_requested.set()
+    events.rerecord_requested.set()
     events.reset()
     assert events.phase == DAggerPhase.AUTONOMOUS
     assert not events.upload_requested.is_set()
+    assert not events.next_episode_requested.is_set()
+    assert not events.rerecord_requested.is_set()
+
+
+def test_dagger_continuous_right_arrow_saves_and_resets_record_counter(monkeypatch):
+    dataset = _FakeContinuousDataset()
+    shutdown_event = Event()
+    strategy, ctx, robot = _make_dagger_continuous_strategy(
+        monkeypatch, dataset, shutdown_event, interpolation_multiplier=2
+    )
+    observations = 0
+
+    def get_observation():
+        nonlocal observations
+        observations += 1
+        if observations == 1:
+            strategy._events.next_episode_requested.set()
+        else:
+            shutdown_event.set()
+        return {"x": 0.0}
+
+    robot.get_observation.side_effect = get_observation
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.add_frame_calls == 2
+    assert dataset.save_episode_calls == 2
+    assert dataset.num_episodes == 2
+
+
+def test_dagger_continuous_left_arrow_discards_in_progress_episode(monkeypatch):
+    from lerobot.rollout.strategies import DAggerPhase
+
+    dataset = _FakeContinuousDataset(has_frames=True)
+    shutdown_event = Event()
+    strategy, ctx, robot = _make_dagger_continuous_strategy(monkeypatch, dataset, shutdown_event)
+
+    def request_rerecord():
+        strategy._events.phase = DAggerPhase.PAUSED
+        strategy._events.rerecord_requested.set()
+
+    strategy._engine.resume.side_effect = request_rerecord
+    robot.get_observation.side_effect = lambda: shutdown_event.set() or {"x": 0.0}
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.clear_episode_buffer_calls == 1
+    assert dataset.save_episode_calls == 0
+    assert dataset.num_episodes == 0
+
+
+def test_dagger_continuous_correction_to_paused_saves_episode(monkeypatch):
+    from lerobot.rollout.strategies import DAggerPhase
+
+    dataset = _FakeContinuousDataset(has_frames=True)
+    shutdown_event = Event()
+    strategy, ctx, robot = _make_dagger_continuous_strategy(monkeypatch, dataset, shutdown_event)
+
+    def stop_correction():
+        strategy._events.phase = DAggerPhase.CORRECTING
+        strategy._events.request_transition("correction")
+
+    strategy._engine.resume.side_effect = stop_correction
+    robot.get_observation.side_effect = lambda: shutdown_event.set() or {"x": 0.0}
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.save_episode_calls == 1
+    assert dataset.num_episodes == 1
+
+
+def test_dagger_continuous_next_episode_skips_empty_buffer(monkeypatch):
+    from lerobot.rollout.strategies import DAggerPhase
+
+    dataset = _FakeContinuousDataset(has_frames=False)
+    shutdown_event = Event()
+    strategy, ctx, robot = _make_dagger_continuous_strategy(monkeypatch, dataset, shutdown_event)
+
+    def request_next_episode():
+        strategy._events.phase = DAggerPhase.PAUSED
+        strategy._events.next_episode_requested.set()
+
+    strategy._engine.resume.side_effect = request_next_episode
+    robot.get_observation.side_effect = lambda: shutdown_event.set() or {"x": 0.0}
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.save_episode_calls == 0
+    assert dataset.num_episodes == 0
 
 
 # ---------------------------------------------------------------------------

@@ -19,11 +19,13 @@ imitation learning.  Alternates between autonomous policy execution and
 human intervention via teleoperator.
 
 Input is controlled via either a keyboard or foot pedal, selected by
-the ``input_device`` config field.  Each device exposes three actions:
+the ``input_device`` config field.  Keyboard controls expose five actions:
 
     1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
     2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
-    3. **upload**        — Push dataset to hub on demand (corrections-only mode).
+    3. **next_episode** — Save the current in-progress episode.
+    4. **rerecord_episode** — Discard the current in-progress episode.
+    5. **upload**        — Push dataset to hub on demand (corrections-only mode).
     ESC (keyboard only) — Stop session.
 
 Recording modes:
@@ -125,6 +127,8 @@ class DAggerEvents:
         # Session-level flags
         self.stop_recording = Event()
         self.upload_requested = Event()
+        self.next_episode_requested = Event()
+        self.rerecord_requested = Event()
 
     # -- Thread-safe phase access ------------------------------------------
 
@@ -169,6 +173,8 @@ class DAggerEvents:
             self._phase = DAggerPhase.AUTONOMOUS
             self._pending_transition = None
         self.upload_requested.clear()
+        self.next_episode_requested.clear()
+        self.rerecord_requested.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +241,7 @@ def _follower_smooth_move_to(
 
 
 def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
-    """Initialise keyboard listener with DAgger 3-key controls.
+    """Initialise keyboard listener with DAgger keyboard controls.
 
     Returns the pynput Listener (or ``None`` in headless mode or when
     pynput is unavailable).
@@ -249,6 +255,8 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
         "space": keyboard.Key.space,
         "tab": keyboard.Key.tab,
         "enter": keyboard.Key.enter,
+        "right": keyboard.Key.right,
+        "left": keyboard.Key.left,
     }
 
     def _resolve_key(key) -> str | None:
@@ -279,6 +287,10 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
                 return
             if resolved in key_to_event:
                 events.request_transition(key_to_event[resolved])
+            if resolved == cfg.next_episode:
+                events.next_episode_requested.set()
+            if resolved == cfg.rerecord_episode:
+                events.rerecord_requested.set()
             if resolved == cfg.upload:
                 events.upload_requested.set()
         except Exception as e:
@@ -287,9 +299,11 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     logger.info(
-        "DAgger keyboard listener started (pause_resume='%s', correction='%s', upload='%s', ESC=stop)",
+        "DAgger keyboard listener started (pause_resume='%s', correction='%s', next_episode='%s', rerecord_episode='%s', upload='%s', ESC=stop)",
         cfg.pause_resume,
         cfg.correction,
+        cfg.next_episode,
+        cfg.rerecord_episode,
         cfg.upload,
     )
     return listener
@@ -451,6 +465,43 @@ class DAggerStrategy(RolloutStrategy):
         episode_duration_s = self._episode_duration_s
         logger.info("DAgger continuous recording started (episode_duration=%.0fs)", episode_duration_s)
 
+        def has_pending_episode_frames() -> bool:
+            return bool(dataset is not None and dataset.has_pending_frames())
+
+        def reset_episode_tracking() -> None:
+            nonlocal episode_start, record_tick
+            episode_start = time.perf_counter()
+            record_tick = 0
+
+        def maybe_save_current_episode(reason: str, elapsed: float | None = None) -> bool:
+            nonlocal episodes_since_push
+            if not has_pending_episode_frames():
+                return False
+
+            with self._episode_lock:
+                dataset.save_episode()
+            episodes_since_push += 1
+            self._needs_push.set()
+            if elapsed is None:
+                logger.info("%s (total: %d)", reason, dataset.num_episodes)
+            else:
+                logger.info("%s (total: %d, elapsed: %.1fs)", reason, dataset.num_episodes, elapsed)
+            log_say(f"Episode {dataset.num_episodes} saved", play_sounds)
+
+            if episodes_since_push >= self.config.upload_every_n_episodes:
+                self._background_push(dataset, cfg)
+                episodes_since_push = 0
+            return True
+
+        def discard_current_episode() -> bool:
+            if not has_pending_episode_frames():
+                return False
+            with self._episode_lock:
+                dataset.clear_episode_buffer()
+            logger.info("In-progress episode discarded")
+            log_say("Re-record episode", play_sounds)
+            return True
+
         with VideoEncodingManager(dataset):
             try:
                 while not events.stop_recording.is_set() and not ctx.runtime.shutdown_event.is_set():
@@ -459,6 +510,21 @@ class DAggerStrategy(RolloutStrategy):
                     if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
+
+                    # Manual episode controls are intentionally scoped to the
+                    # in-progress buffer.  Saved episodes on disk are never
+                    # deleted or rolled back.
+                    if events.rerecord_requested.is_set():
+                        events.rerecord_requested.clear()
+                        if not discard_current_episode():
+                            logger.info("Re-record requested, but no in-progress frames were buffered")
+                        reset_episode_tracking()
+
+                    if events.next_episode_requested.is_set():
+                        events.next_episode_requested.clear()
+                        if not maybe_save_current_episode("Episode saved by user"):
+                            logger.info("Next episode requested, but no in-progress frames were buffered")
+                        reset_episode_tracking()
 
                     # Process transitions
                     transition = events.consume_transition()
@@ -474,6 +540,10 @@ class DAggerStrategy(RolloutStrategy):
                         )
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
+                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+                            if not maybe_save_current_episode("Correction ended; episode saved"):
+                                logger.info("Correction ended, but no in-progress frames were buffered")
+                            reset_episode_tracking()
 
                     phase = events.phase
                     obs = robot.get_observation()
@@ -535,22 +605,9 @@ class DAggerStrategy(RolloutStrategy):
                     # episode boundary lands on a clean autonomous frame.
                     elapsed = time.perf_counter() - episode_start
                     if elapsed >= episode_duration_s and phase != DAggerPhase.CORRECTING:
-                        with self._episode_lock:
-                            dataset.save_episode()
-                        episodes_since_push += 1
-                        self._needs_push.set()
-                        logger.info(
-                            "Episode saved (total: %d, elapsed: %.1fs)",
-                            dataset.num_episodes,
-                            elapsed,
-                        )
-                        log_say(f"Episode {dataset.num_episodes} saved", play_sounds)
-
-                        if episodes_since_push >= self.config.upload_every_n_episodes:
-                            self._background_push(dataset, cfg)
-                            episodes_since_push = 0
-
-                        episode_start = time.perf_counter()
+                        if not maybe_save_current_episode("Episode saved", elapsed):
+                            logger.info("Episode rotation reached, but no in-progress frames were buffered")
+                        reset_episode_tracking()
 
                     dt = time.perf_counter() - loop_start
                     if (sleep_t := control_interval - dt) > 0:
@@ -564,10 +621,11 @@ class DAggerStrategy(RolloutStrategy):
                 logger.info("DAgger continuous control loop ended — pausing engine")
                 engine.pause()
                 with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                    if has_pending_episode_frames():
+                        with self._episode_lock:
+                            dataset.save_episode()
+                        self._needs_push.set()
+                        logger.info("Final in-progress episode saved")
 
     # ------------------------------------------------------------------
     # Corrections-only mode (record_autonomous=False)

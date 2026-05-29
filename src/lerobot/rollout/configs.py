@@ -100,11 +100,14 @@ class DAggerKeyboardConfig:
     """Keyboard key bindings for DAgger controls.
 
     Keys are specified as single characters (e.g. ``"c"``, ``"h"``) or
-    special key names (``"space"``).
+    special key names (``"space"``, ``"tab"``, ``"enter"``, ``"left"``,
+    ``"right"``).
     """
 
     pause_resume: str = "space"
     correction: str = "tab"
+    next_episode: str = "right"
+    rerecord_episode: str = "left"
     upload: str = "enter"
 
 
@@ -130,11 +133,13 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     Intervention frames are tagged with ``intervention=True``.
 
     Input is controlled via either a keyboard or foot pedal, selected by
-    ``input_device``.  Each device exposes three actions:
+    ``input_device``.  Keyboard controls expose:
 
     1. **pause_resume** — toggle policy execution on/off.
     2. **correction** — toggle human correction recording.
-    3. **upload** — push dataset to hub on demand (corrections-only mode).
+    3. **next_episode** — save the current in-progress episode.
+    4. **rerecord_episode** — discard the current in-progress episode.
+    5. **upload** — push dataset to hub on demand (corrections-only mode).
 
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``

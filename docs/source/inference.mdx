@@ -140,12 +140,18 @@ lerobot-rollout \
 
 **Keyboard controls** (default input device):
 
-| Key     | Action                                      |
-| ------- | ------------------------------------------- |
-| `Space` | Pause / resume policy execution             |
-| `Tab`   | Start / stop human correction               |
-| `Enter` | Push dataset to Hub (corrections-only mode) |
-| `ESC`   | Stop the session                            |
+| Key           | Action                                      |
+| ------------- | ------------------------------------------- |
+| `Space`       | Pause / resume policy execution             |
+| `Tab`         | Start / stop human correction               |
+| `Right Arrow` | Save current episode and start the next     |
+| `Left Arrow`  | Discard current episode and re-record it    |
+| `Enter`       | Push dataset to Hub (corrections-only mode) |
+| `ESC`         | Stop the session                            |
+
+`Left Arrow` only discards the current in-progress episode buffer. It does not delete episodes
+that have already been saved to disk. In continuous recording mode, the current episode may
+contain both autonomous and correction frames, and `Left Arrow` discards both.
 
 Foot pedal input is also supported via `--strategy.input_device=pedal`. Configure pedal codes with `--strategy.pedal.*` flags.
 

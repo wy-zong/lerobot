@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import numpy as np
 import pytest
 import torch
+
+from lerobot.processor import ProcessorStep
 
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
@@ -244,6 +248,208 @@ def test_create_inference_engine_sync():
         device="cpu",
     )
     assert isinstance(engine, SyncInferenceEngine)
+
+
+class _DropObservationStateStep(ProcessorStep):
+    def __init__(self):
+        self.reset_calls = 0
+
+    def __call__(self, transition):
+        from lerobot.types import TransitionKey
+        from lerobot.utils.constants import OBS_STATE
+
+        new_transition = transition.copy()
+        observation = dict(new_transition[TransitionKey.OBSERVATION])
+        observation.pop(OBS_STATE, None)
+        new_transition[TransitionKey.OBSERVATION] = observation
+        return new_transition
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def transform_features(self, features):
+        return features
+
+
+class _SyncStubPolicy:
+    def __init__(
+        self,
+        *,
+        action_chunk: torch.Tensor | None = None,
+        select_action: torch.Tensor | None = None,
+        n_action_steps: int | None = None,
+    ):
+        if action_chunk is None:
+            action_chunk = torch.empty(1, 0, 2)
+        if select_action is None:
+            select_action = torch.zeros(1, action_chunk.shape[-1])
+        self.action_chunk = action_chunk
+        self.select_action_tensor = select_action
+        self.config = SimpleNamespace(
+            use_amp=False,
+            n_action_steps=n_action_steps or action_chunk.shape[1],
+            action_feature_names=None,
+        )
+        self.predict_action_chunk_calls = 0
+        self.select_action_calls = 0
+        self.reset_calls = 0
+        self.last_observation = None
+
+    def reset(self):
+        self.reset_calls += 1
+
+    def predict_action_chunk(self, observation):
+        self.predict_action_chunk_calls += 1
+        self.last_observation = observation
+        return self.action_chunk.clone()
+
+    def select_action(self, observation):
+        self.select_action_calls += 1
+        self.last_observation = observation
+        return self.select_action_tensor.clone()
+
+
+def _make_test_sync_engine(policy, preprocessor, postprocessor):
+    from lerobot.rollout import SyncInferenceEngine
+    from lerobot.utils.constants import ACTION
+
+    action_names = ["joint_0.pos", "joint_1.pos"]
+    return SyncInferenceEngine(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        dataset_features={ACTION: {"names": action_names}},
+        ordered_action_keys=action_names,
+        task="test task",
+        device="cpu",
+        robot_type="mock_robot",
+    )
+
+
+def _make_obs_frame(state):
+    from lerobot.utils.constants import OBS_STATE
+
+    return {OBS_STATE: np.asarray(state, dtype=np.float32)}
+
+
+def test_sync_relative_actions_fifo_anchors_chunk_to_refill_state():
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        PolicyProcessorPipeline,
+        RelativeActionsProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    action_chunk = torch.tensor([[[0.1, -0.2], [0.3, -0.4], [0.5, -0.6]]], dtype=torch.float32)
+    policy = _SyncStubPolicy(action_chunk=action_chunk)
+    relative_step = RelativeActionsProcessorStep(enabled=True)
+    preprocessor = PolicyProcessorPipeline(steps=[relative_step, _DropObservationStateStep()])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    actions = [
+        engine.get_action(_make_obs_frame([10.0, 20.0])),
+        engine.get_action(_make_obs_frame([100.0, 200.0])),
+        engine.get_action(_make_obs_frame([-1.0, -2.0])),
+    ]
+
+    expected = action_chunk.squeeze(0) + torch.tensor([10.0, 20.0])
+    for action, expected_action in zip(actions, expected, strict=True):
+        torch.testing.assert_close(action, expected_action)
+    assert policy.predict_action_chunk_calls == 1
+    assert policy.select_action_calls == 0
+
+
+def test_sync_relative_actions_no_state_model_input_still_postprocesses_from_raw_state():
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        PolicyProcessorPipeline,
+        RelativeActionsProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+    from lerobot.utils.constants import OBS_STATE
+
+    action_chunk = torch.tensor([[[1.0, -1.5]]], dtype=torch.float32)
+    policy = _SyncStubPolicy(action_chunk=action_chunk)
+    relative_step = RelativeActionsProcessorStep(enabled=True)
+    preprocessor = PolicyProcessorPipeline(steps=[relative_step, _DropObservationStateStep()])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    action = engine.get_action(_make_obs_frame([5.0, 6.0]))
+
+    assert OBS_STATE not in policy.last_observation
+    torch.testing.assert_close(action, torch.tensor([6.0, 4.5]))
+
+
+def test_sync_non_relative_actions_keep_select_action_path():
+    from lerobot.processor import (
+        PolicyProcessorPipeline,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    policy = _SyncStubPolicy(
+        action_chunk=torch.tensor([[[100.0, 200.0]]], dtype=torch.float32),
+        select_action=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+    )
+    preprocessor = PolicyProcessorPipeline(steps=[])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    action = engine.get_action(_make_obs_frame([10.0, 20.0]))
+
+    torch.testing.assert_close(action, torch.tensor([1.0, 2.0]))
+    assert policy.select_action_calls == 1
+    assert policy.predict_action_chunk_calls == 0
+
+
+def test_sync_relative_actions_reset_clears_fifo_and_cached_state():
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        PolicyProcessorPipeline,
+        RelativeActionsProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    action_chunk = torch.tensor([[[0.25, 0.5], [1.0, 1.5]]], dtype=torch.float32)
+    policy = _SyncStubPolicy(action_chunk=action_chunk)
+    relative_step = RelativeActionsProcessorStep(enabled=True)
+    drop_state_step = _DropObservationStateStep()
+    preprocessor = PolicyProcessorPipeline(steps=[relative_step, drop_state_step])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step)],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    torch.testing.assert_close(engine.get_action(_make_obs_frame([1.0, 2.0])), torch.tensor([1.25, 2.5]))
+    assert relative_step.get_cached_state() is not None
+
+    engine.reset()
+
+    assert policy.reset_calls == 1
+    assert drop_state_step.reset_calls == 1
+    assert relative_step.get_cached_state() is None
+    torch.testing.assert_close(
+        engine.get_action(_make_obs_frame([10.0, 20.0])), torch.tensor([10.25, 20.5])
+    )
 
 
 # ---------------------------------------------------------------------------

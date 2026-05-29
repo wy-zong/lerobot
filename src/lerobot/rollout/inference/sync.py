@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import logging
+from collections import deque
 from contextlib import nullcontext
 from copy import copy
 
@@ -25,33 +26,21 @@ import torch
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.policies.utils import make_robot_action, prepare_observation_for_inference
 from lerobot.processor import PolicyProcessorPipeline
+from lerobot.processor.relative_action_processor import RelativeActionsProcessorStep
+from lerobot.utils.constants import ACTION
 
 from .base import InferenceEngine
 
 logger = logging.getLogger(__name__)
 
 
-# TODO(Steven): support relative-action policies.  The per-tick flow refreshes
-# ``RelativeActionsProcessorStep._last_state`` every call, so cached chunk
-# actions popped on later ticks get reanchored to the *current* robot state and
-# absolute targets drift through the chunk.  Relative-action policies are
-# rejected at context-build time today; RTC postprocesses the whole chunk and
-# is unaffected.
-#
-# Candidate fix: drive the policy via ``predict_action_chunk`` and serve a
-# local FIFO of postprocessed actions.  Eliminates drift by construction and
-# saves per-tick pre/post work, but bypasses ``select_action`` — needs
-# fallbacks for SAC (raises), ACT temporal ensembling (ensembler lives in
-# ``select_action``), and Diffusion-family (obs-history queues populated as a
-# side effect of ``select_action``).
-
-
 class SyncInferenceEngine(InferenceEngine):
     """Inline synchronous inference: compute one action per call.
 
-    ``get_action`` runs the full policy pipeline (pre/post-processor +
-    ``select_action``) on the given observation frame and returns a
-    CPU action tensor reordered to match the dataset action keys.
+    Non-relative policies keep the legacy per-tick ``select_action`` path.
+    Relative-action policies refill a local FIFO with one postprocessed
+    ``predict_action_chunk`` result so the whole chunk is anchored to the
+    same observation state.
     """
 
     def __init__(
@@ -73,10 +62,18 @@ class SyncInferenceEngine(InferenceEngine):
         self._task = task
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
+        self._relative_actions_enabled = any(
+            isinstance(step, RelativeActionsProcessorStep) and step.enabled
+            for step in getattr(preprocessor, "steps", ())
+        )
+        self._action_queue: deque[torch.Tensor] = deque()
+        if self._relative_actions_enabled:
+            self._ensure_relative_action_names()
         logger.info(
-            "SyncInferenceEngine initialized (device=%s, action_keys=%d)",
+            "SyncInferenceEngine initialized (device=%s, action_keys=%d, relative_actions=%s)",
             self._device,
             len(ordered_action_keys),
+            self._relative_actions_enabled,
         )
 
     def start(self) -> None:
@@ -90,14 +87,24 @@ class SyncInferenceEngine(InferenceEngine):
     def reset(self) -> None:
         """Reset the policy and pre/post-processors."""
         logger.info("Resetting sync inference state (policy + processors)")
+        self._action_queue.clear()
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
+        if self._relative_actions_enabled and self._action_queue:
+            return self._action_queue.popleft()
         if obs_frame is None:
             return None
+        if self._relative_actions_enabled:
+            return self._get_relative_action(obs_frame)
+
+        return self._get_select_action(obs_frame)
+
+    def _get_select_action(self, obs_frame: dict) -> torch.Tensor:
+        """Run the legacy per-tick ``select_action`` sync inference path."""
         # Shallow copy is intentional: the caller (`send_next_action`) builds
         # ``obs_frame`` fresh per tick via ``build_dataset_frame``, so the
         # tensor/array values are not shared with any other reader.
@@ -115,8 +122,53 @@ class SyncInferenceEngine(InferenceEngine):
             action = self._policy.select_action(observation)
             action = self._postprocessor(action)
         action_tensor = action.squeeze(0).cpu()
+        return self._action_tensor_to_ordered_action(action_tensor)
 
+    def _get_relative_action(self, obs_frame: dict) -> torch.Tensor | None:
+        """Refill the local action FIFO from one postprocessed relative-action chunk."""
+        observation = copy(obs_frame)
+        autocast_ctx = (
+            torch.autocast(device_type=self._device.type)
+            if self._device.type == "cuda" and self._policy.config.use_amp
+            else nullcontext()
+        )
+        with torch.inference_mode(), autocast_ctx:
+            observation = prepare_observation_for_inference(
+                observation, self._device, self._task, self._robot_type
+            )
+            observation = self._preprocessor(observation)
+            action_chunk = self._policy.predict_action_chunk(observation)
+            action_chunk = self._postprocessor(action_chunk)
+
+        self._enqueue_action_chunk(action_chunk)
+        if not self._action_queue:
+            return None
+        return self._action_queue.popleft()
+
+    def _enqueue_action_chunk(self, action_chunk: torch.Tensor) -> None:
+        """Store postprocessed absolute actions in execution order."""
+        action_chunk = action_chunk.squeeze(0).cpu()
+        if action_chunk.ndim == 1:
+            action_chunk = action_chunk.unsqueeze(0)
+
+        n_action_steps = getattr(self._policy.config, "n_action_steps", action_chunk.shape[0])
+        for action_tensor in action_chunk[:n_action_steps]:
+            self._action_queue.append(self._action_tensor_to_ordered_action(action_tensor))
+
+    def _action_tensor_to_ordered_action(self, action_tensor: torch.Tensor) -> torch.Tensor:
         # Reorder to match dataset action ordering so the caller can treat
         # the returned tensor uniformly across backends.
         action_dict = make_robot_action(action_tensor, self._dataset_features)
         return torch.tensor([action_dict[k] for k in self._ordered_action_keys])
+
+    def _ensure_relative_action_names(self) -> None:
+        for step in self._preprocessor.steps:
+            if not isinstance(step, RelativeActionsProcessorStep) or not step.enabled:
+                continue
+            if step.action_names is not None:
+                continue
+            cfg_names = getattr(self._policy.config, "action_feature_names", None)
+            if cfg_names:
+                step.action_names = list(cfg_names)
+            elif ACTION in self._dataset_features:
+                step.action_names = list(self._dataset_features[ACTION]["names"])

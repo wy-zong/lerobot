@@ -145,13 +145,17 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     are recorded — each correction becomes its own episode.  Set to ``True``
     to record both autonomous and correction frames with size-based episode
     rotation (same as Sentry) and background uploading.  ``push_to_hub`` is
-    blocked while a correction is in progress.
+    blocked while a correction is in progress.  ``model_test_mode`` only
+    changes the continuous ``record_autonomous=True`` path: episode boundaries
+    return the robot to the startup pose, run a teleop reset window, and then
+    restart autonomous inference.
     """
 
     # Number of correction episodes to collect (corrections-only mode).
     # When None, falls back to ``--dataset.num_episodes``.
     num_episodes: int | None = None
     record_autonomous: bool = False
+    model_test_mode: bool = False
     upload_every_n_episodes: int = 5
     # Target video file size in MB for episode rotation (record_autonomous
     # mode only).  Defaults to DEFAULT_VIDEO_FILE_SIZE_IN_MB when None.

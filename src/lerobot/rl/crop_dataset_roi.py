@@ -281,9 +281,16 @@ if __name__ == "__main__":
         default=None,
         help="The repository id for the new cropped and resized dataset. If not provided, it defaults to `repo_id` + '_cropped_resized'.",
     )
+    parser.add_argument(
+        "--video-backend",
+        type=str,
+        default=None,
+        choices=["torchcodec", "pyav", "video_reader"],
+        help="Video decoding backend to use when reading the source dataset. Defaults to LeRobot's default backend.",
+    )
     args = parser.parse_args()
 
-    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root)
+    dataset = LeRobotDataset(repo_id=args.repo_id, root=args.root, video_backend=args.video_backend)
 
     images = get_image_from_lerobot_dataset(dataset)
     images = {k: v.cpu().permute(1, 2, 0).numpy() for k, v in images.items()}

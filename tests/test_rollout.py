@@ -20,6 +20,8 @@ import contextlib
 import dataclasses
 from threading import Event
 from types import SimpleNamespace
+from threading import Event
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -88,6 +90,7 @@ def test_dagger_config_defaults():
     cfg = DAggerStrategyConfig()
     assert cfg.num_episodes is None
     assert cfg.record_autonomous is False
+    assert cfg.model_test_mode is False
     assert cfg.input_device == "keyboard"
     assert cfg.keyboard.next_episode == "right"
     assert cfg.keyboard.rerecord_episode == "left"
@@ -734,3 +737,155 @@ def test_rollout_context_fields():
 
     field_names = {f.name for f in dataclasses.fields(RolloutContext)}
     assert field_names == {"runtime", "hardware", "policy", "processors", "data"}
+
+
+def test_dagger_events_clear_episode_requests():
+    from lerobot.rollout.strategies import DAggerEvents
+
+    events = DAggerEvents()
+    events.upload_requested.set()
+    events.save_episode_requested.set()
+    events.discard_episode_requested.set()
+    events.clear_pending_controls()
+    assert not events.upload_requested.is_set()
+    assert not events.save_episode_requested.is_set()
+    assert not events.discard_episode_requested.is_set()
+
+
+def _make_dagger_model_test_context(reset_time_s=0.0):
+    dataset_cfg = SimpleNamespace(
+        reset_time_s=reset_time_s,
+        single_task="test task",
+        tags=[],
+        private=False,
+        push_to_hub=False,
+    )
+    cfg = SimpleNamespace(
+        fps=10.0,
+        interpolation_multiplier=1,
+        dataset=dataset_cfg,
+        task="test task",
+        play_sounds=False,
+        display_data=False,
+        display_compressed_images=False,
+        use_torch_compile=False,
+        duration=0.0,
+    )
+    robot = MagicMock()
+    robot.get_observation.return_value = {"motor_1.pos": 0.0}
+    teleop = MagicMock()
+    teleop.feedback_features = {}
+    teleop.get_action.return_value = {"motor_1.pos": 1.0}
+    dataset = MagicMock()
+    dataset.add_frame = MagicMock()
+    processors = SimpleNamespace(
+        robot_observation_processor=MagicMock(side_effect=lambda obs: obs),
+        teleop_action_processor=MagicMock(side_effect=lambda args: args[0]),
+        robot_action_processor=MagicMock(side_effect=lambda args: args[0]),
+    )
+    ctx = SimpleNamespace(
+        runtime=SimpleNamespace(cfg=cfg, shutdown_event=Event()),
+        hardware=SimpleNamespace(
+            robot_wrapper=robot,
+            teleop=teleop,
+            initial_position={"motor_1.pos": 0.0},
+        ),
+        processors=processors,
+        data=SimpleNamespace(dataset=dataset, dataset_features={}, ordered_action_keys=[]),
+    )
+    return ctx, dataset
+
+
+def test_dagger_continuous_episode_save_and_discard_guards(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_mod
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerStrategy
+
+    monkeypatch.setattr(dagger_mod, "log_say", MagicMock())
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True, model_test_mode=True))
+    dataset = MagicMock()
+    dataset.num_episodes = 0
+    dataset.has_pending_frames.return_value = True
+
+    def save_episode():
+        dataset.num_episodes += 1
+        dataset.has_pending_frames.return_value = False
+
+    dataset.save_episode.side_effect = save_episode
+    assert (
+        strategy._save_continuous_episode_if_pending(
+            dataset, elapsed=1.0, play_sounds=False
+        )
+        is True
+    )
+    dataset.save_episode.assert_called_once()
+    assert strategy._needs_push.is_set()
+
+    assert (
+        strategy._save_continuous_episode_if_pending(
+            dataset, elapsed=1.0, play_sounds=False
+        )
+        is False
+    )
+    assert dataset.save_episode.call_count == 1
+
+    dataset.has_pending_frames.return_value = True
+    assert strategy._discard_continuous_episode_if_pending(dataset) is True
+    dataset.clear_episode_buffer.assert_called_once()
+
+
+def test_dagger_model_test_episode_reset_zero_reset_time(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_mod
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerEvents, DAggerPhase, DAggerStrategy
+
+    ctx, _ = _make_dagger_model_test_context(reset_time_s=0.0)
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True, model_test_mode=True))
+    strategy._cached_obs_processed = {"stale": True}
+    strategy._warmup_flushed = True
+    engine = MagicMock()
+    interpolator = MagicMock()
+    events = DAggerEvents()
+    events.phase = DAggerPhase.PAUSED
+    events.upload_requested.set()
+    events.save_episode_requested.set()
+
+    return_mock = MagicMock()
+    monkeypatch.setattr(DAggerStrategy, "_return_to_initial_position", return_mock)
+    monkeypatch.setattr(dagger_mod, "log_say", MagicMock())
+
+    strategy._run_model_test_episode_reset(ctx, engine, interpolator, events, control_interval=0.1)
+
+    engine.pause.assert_called_once()
+    engine.resume.assert_called_once()
+    assert engine.reset.call_count == 2
+    assert interpolator.reset.call_count == 2
+    return_mock.assert_called_once_with(ctx.hardware)
+    assert strategy._cached_obs_processed is None
+    assert strategy._warmup_flushed is False
+    assert events.phase == DAggerPhase.AUTONOMOUS
+    assert not events.upload_requested.is_set()
+    assert not events.save_episode_requested.is_set()
+
+
+def test_dagger_model_test_reset_window_uses_teleop_without_recording(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_mod
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerEvents, DAggerStrategy
+
+    ctx, dataset = _make_dagger_model_test_context(reset_time_s=60.0)
+    strategy = DAggerStrategy(DAggerStrategyConfig(record_autonomous=True, model_test_mode=True))
+    events = DAggerEvents()
+
+    def stop_after_first_action(_action):
+        ctx.runtime.shutdown_event.set()
+
+    ctx.hardware.robot_wrapper.send_action.side_effect = stop_after_first_action
+    monkeypatch.setattr(dagger_mod, "precise_sleep", lambda _seconds: None)
+
+    strategy._run_model_test_reset_window(ctx, events, control_interval=0.1)
+
+    ctx.hardware.robot_wrapper.get_observation.assert_called()
+    ctx.hardware.teleop.get_action.assert_called()
+    ctx.hardware.robot_wrapper.send_action.assert_called_once_with({"motor_1.pos": 1.0})
+    dataset.add_frame.assert_not_called()

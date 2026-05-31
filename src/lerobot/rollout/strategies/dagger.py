@@ -19,14 +19,12 @@ imitation learning.  Alternates between autonomous policy execution and
 human intervention via teleoperator.
 
 Input is controlled via either a keyboard or foot pedal, selected by
-the ``input_device`` config field.  Keyboard controls expose five actions:
+the ``input_device`` config field.  Each device exposes three actions:
 
-    1. **pause_resume** — Toggle policy execution (AUTONOMOUS <-> PAUSED).
-    2. **correction**   — Toggle correction recording (PAUSED <-> CORRECTING).
-    3. **next_episode** — Save the current in-progress episode.
-    4. **rerecord_episode** — Discard the current in-progress episode.
-    5. **upload**        — Push dataset to hub on demand (corrections-only mode).
-    ESC (keyboard only) — Stop session.
+    1. **pause_resume** -- Toggle policy execution (AUTONOMOUS <-> PAUSED).
+    2. **correction**   -- Toggle correction recording (PAUSED <-> CORRECTING).
+    3. **upload**       -- Push dataset to hub on demand (corrections-only mode).
+    ESC (keyboard only) -- Stop session.
 
 Recording modes:
     ``record_autonomous=True``:  Sentry-like continuous recording with
@@ -36,11 +34,11 @@ Recording modes:
         Each correction (start to stop) becomes one episode.
 
 Teleoperator handover:
-    On AUTONOMOUS → PAUSED, actuated teleops (those with non-empty
+    On AUTONOMOUS -> PAUSED, actuated teleops (those with non-empty
     ``feedback_features``, e.g. SO-101, OpenArmMini) are smoothly driven to
     the follower's last position via ``send_feedback`` so the operator takes
     over without a jerk.  Non-actuated teleops cannot be driven,
-    so on PAUSED → CORRECTING the follower is instead slid to the teleop's
+    so on PAUSED -> CORRECTING the follower is instead slid to the teleop's
     current pose before the correction begins.
 """
 
@@ -72,7 +70,12 @@ from lerobot.utils.utils import log_say
 from ..configs import DAggerKeyboardConfig, DAggerPedalConfig, DAggerStrategyConfig
 from ..context import RolloutContext
 from ..robot_wrapper import ThreadSafeRobot
-from .core import RolloutStrategy, estimate_max_episode_seconds, safe_push_to_hub, send_next_action
+from .core import (
+    RolloutStrategy,
+    estimate_max_episode_seconds,
+    safe_push_to_hub,
+    send_next_action,
+)
 
 PYNPUT_AVAILABLE = _pynput_available
 keyboard = None
@@ -127,10 +130,8 @@ class DAggerEvents:
         # Session-level flags
         self.stop_recording = Event()
         self.upload_requested = Event()
-        self.next_episode_requested = Event()
-        self.rerecord_requested = Event()
-
-    # -- Thread-safe phase access ------------------------------------------
+        self.save_episode_requested = Event()
+        self.discard_episode_requested = Event()
 
     @property
     def phase(self) -> DAggerPhase:
@@ -144,11 +145,7 @@ class DAggerEvents:
             self._phase = value
 
     def request_transition(self, event: str) -> None:
-        """Request a phase transition (called from keyboard/pedal threads).
-
-        Only enqueues the request if it corresponds to a valid transition
-        from the current phase, preventing impossible state changes.
-        """
+        """Request a phase transition (called from keyboard/pedal threads)."""
         with self._lock:
             if (self._phase, event) in _DAGGER_TRANSITIONS:
                 self._pending_transition = event
@@ -173,8 +170,16 @@ class DAggerEvents:
             self._phase = DAggerPhase.AUTONOMOUS
             self._pending_transition = None
         self.upload_requested.clear()
-        self.next_episode_requested.clear()
-        self.rerecord_requested.clear()
+        self.save_episode_requested.clear()
+        self.discard_episode_requested.clear()
+
+    def clear_pending_controls(self) -> None:
+        """Drop non-terminal controls queued while a blocking routine runs."""
+        with self._lock:
+            self._pending_transition = None
+        self.upload_requested.clear()
+        self.save_episode_requested.clear()
+        self.discard_episode_requested.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -183,9 +188,7 @@ class DAggerEvents:
 
 
 def _teleop_supports_feedback(teleop: Teleoperator) -> bool:
-    """Return True when the teleop can receive position feedback (is actuated).
-    TODO(Maxime): See if it is possible to unify this interface across teleops instead of duck-typing.
-    """
+    """Return True when the teleop can receive position feedback (is actuated)."""
     return (
         bool(teleop.feedback_features)
         and hasattr(teleop, "disable_torque")
@@ -196,14 +199,7 @@ def _teleop_supports_feedback(teleop: Teleoperator) -> bool:
 def _teleop_smooth_move_to(
     teleop: Teleoperator, target_pos: dict, duration_s: float = 2.0, fps: int = 30
 ) -> None:
-    """Smoothly move an actuated teleop to ``target_pos`` via linear interpolation.
-
-    Requires the teleoperator to support feedback
-    (i.e. have non-empty ``feedback_features`` and implement ``disable_torque`` / ``enable_torque``).
-
-    TODO(Maxime): This blocks up to ``duration_s`` seconds, during this time
-    the follower robot doesn't receive new actions, this could be an issue on LeKiwi.
-    """
+    """Smoothly move an actuated teleop to ``target_pos`` via linear interpolation."""
     teleop.enable_torque()
     current = teleop.get_action()
     steps = max(int(duration_s * fps), 1)
@@ -211,7 +207,8 @@ def _teleop_smooth_move_to(
     for step in range(steps + 1):
         t = step / steps
         interp = {
-            k: current[k] * (1 - t) + target_pos[k] * t if k in target_pos else current[k] for k in current
+            k: current[k] * (1 - t) + target_pos[k] * t if k in target_pos else current[k]
+            for k in current
         }
         teleop.send_feedback(interp)
         time.sleep(1 / fps)
@@ -220,17 +217,14 @@ def _teleop_smooth_move_to(
 def _follower_smooth_move_to(
     robot: ThreadSafeRobot, current: dict, target: dict, duration_s: float = 1.0, fps: int = 30
 ) -> None:
-    """Smoothly move the follower robot from ``current`` to ``target`` action.
-
-    Used when the teleop is non-actuated: instead of driving the leader arm
-    to the follower, we bring the follower to the teleop's current pose.
-    Both ``current`` and ``target`` must be in robot-action key space.
-    """
+    """Smoothly move the follower robot from ``current`` to ``target`` action."""
     steps = max(int(duration_s * fps), 1)
 
     for step in range(steps + 1):
         t = step / steps
-        interp = {k: current[k] * (1 - t) + target[k] * t if k in target else current[k] for k in current}
+        interp = {
+            k: current[k] * (1 - t) + target[k] * t if k in target else current[k] for k in current
+        }
         robot.send_action(interp)
         time.sleep(1 / fps)
 
@@ -241,22 +235,17 @@ def _follower_smooth_move_to(
 
 
 def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
-    """Initialise keyboard listener with DAgger keyboard controls.
-
-    Returns the pynput Listener (or ``None`` in headless mode or when
-    pynput is unavailable).
-    """
+    """Initialise keyboard listener with DAgger controls."""
     if not PYNPUT_AVAILABLE or is_headless():
-        logger.warning("Headless environment or pynput unavailable — keyboard controls disabled")
+        logger.warning("Headless environment or pynput unavailable -- keyboard controls disabled")
         return None
 
-    # Map config key names to pynput Key objects for special keys
     special_keys = {
         "space": keyboard.Key.space,
         "tab": keyboard.Key.tab,
         "enter": keyboard.Key.enter,
-        "right": keyboard.Key.right,
         "left": keyboard.Key.left,
+        "right": keyboard.Key.right,
     }
 
     def _resolve_key(key) -> str | None:
@@ -270,7 +259,6 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
             return key.char
         return None
 
-    # Build mapping: resolved key string -> DAgger event name
     key_to_event = {
         cfg.pause_resume: "pause_resume",
         cfg.correction: "correction",
@@ -287,33 +275,29 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
                 return
             if resolved in key_to_event:
                 events.request_transition(key_to_event[resolved])
-            if resolved == cfg.next_episode:
-                events.next_episode_requested.set()
-            if resolved == cfg.rerecord_episode:
-                events.rerecord_requested.set()
             if resolved == cfg.upload:
                 events.upload_requested.set()
+            if resolved == "right":
+                events.save_episode_requested.set()
+            if resolved == "left":
+                events.discard_episode_requested.set()
         except Exception as e:
             logger.debug("Key error: %s", e)
 
     listener = keyboard.Listener(on_press=on_press)
     listener.start()
     logger.info(
-        "DAgger keyboard listener started (pause_resume='%s', correction='%s', next_episode='%s', rerecord_episode='%s', upload='%s', ESC=stop)",
+        "DAgger keyboard listener started (pause_resume='%s', correction='%s', upload='%s', "
+        "right=save episode, left=discard episode, ESC=stop)",
         cfg.pause_resume,
         cfg.correction,
-        cfg.next_episode,
-        cfg.rerecord_episode,
         cfg.upload,
     )
     return listener
 
 
 def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
-    """Initialise foot pedal listener with DAgger 3-pedal controls.
-
-    Returns the pedal listener thread (or ``None`` if evdev is unavailable).
-    """
+    """Initialise foot pedal listener with DAgger 3-pedal controls."""
     code_to_event = {
         cfg.pause_resume: "pause_resume",
         cfg.correction: "correction",
@@ -335,19 +319,7 @@ def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
 
 
 class DAggerStrategy(RolloutStrategy):
-    """Human-in-the-Loop data collection with intervention tagging.
-
-    State machine::
-
-        AUTONOMOUS --(key1)--> PAUSED --(key2)--> CORRECTING --(key2)--> PAUSED
-                               --(key1)--> AUTONOMOUS
-
-    Recording modes:
-        ``record_autonomous=True``: Sentry-like continuous recording with
-            time-based episode rotation.  Intervention frames tagged True.
-        ``record_autonomous=False``: Only correction windows recorded.
-            Each correction = one episode.  Upload on demand via key3.
-    """
+    """Human-in-the-Loop data collection with intervention tagging."""
 
     config: DAggerStrategyConfig
 
@@ -401,7 +373,6 @@ class DAggerStrategy(RolloutStrategy):
             logger.info("Stopping keyboard listener")
             self._listener.stop()
 
-        # Flush any queued/running push cleanly
         if self._push_executor is not None:
             logger.info("Shutting down push executor (waiting for pending pushes)...")
             self._push_executor.shutdown(wait=True)
@@ -430,14 +401,103 @@ class DAggerStrategy(RolloutStrategy):
     # Continuous recording mode (record_autonomous=True)
     # ------------------------------------------------------------------
 
-    def _run_continuous(self, ctx: RolloutContext) -> None:
-        """Sentry-like continuous recording with intervention tagging.
+    def _save_continuous_episode_if_pending(self, dataset, elapsed: float, play_sounds: bool) -> bool:
+        """Save the current continuous episode only when frames were recorded."""
+        if not dataset.has_pending_frames():
+            logger.info("Skipping episode save because no frames are pending")
+            return False
+        with self._episode_lock:
+            dataset.save_episode()
+        self._needs_push.set()
+        logger.info(
+            "Episode saved (total: %d, elapsed: %.1fs)",
+            dataset.num_episodes,
+            elapsed,
+        )
+        log_say(f"Episode {dataset.num_episodes} saved", play_sounds)
+        return True
 
-        Episodes are auto-rotated every ``episode_time_s`` seconds and
-        uploaded in the background every ``upload_every_n_episodes`` episodes.
-        Both autonomous and correction frames are recorded; corrections are
-        tagged with ``intervention=True``.
-        """
+    @staticmethod
+    def _discard_continuous_episode_if_pending(dataset) -> bool:
+        """Discard the current continuous episode buffer only when it has frames."""
+        if not dataset.has_pending_frames():
+            logger.info("Skipping episode discard because no frames are pending")
+            return False
+        dataset.clear_episode_buffer()
+        logger.info("Pending episode buffer discarded")
+        return True
+
+    def _after_continuous_episode_saved(self, dataset, cfg, episodes_since_push: int) -> int:
+        episodes_since_push += 1
+        if episodes_since_push >= self.config.upload_every_n_episodes:
+            self._background_push(dataset, cfg)
+            episodes_since_push = 0
+        return episodes_since_push
+
+    def _reset_model_test_policy_state(self, engine, interpolator) -> None:
+        """Clear rollout-side policy state before or after a model-test reset."""
+        interpolator.reset()
+        engine.reset()
+        self._cached_obs_processed = None
+        self._warmup_flushed = False
+
+    def _run_model_test_reset_window(
+        self, ctx: RolloutContext, events: DAggerEvents, control_interval: float
+    ) -> None:
+        """Run a lerobot-record-style teleop reset window without writing dataset frames."""
+        cfg = ctx.runtime.cfg
+        reset_time_s = cfg.dataset.reset_time_s if cfg.dataset is not None else 0.0
+        if reset_time_s <= 0:
+            return
+
+        robot = ctx.hardware.robot_wrapper
+        teleop = ctx.hardware.teleop
+        reset_start = time.perf_counter()
+        while (
+            time.perf_counter() - reset_start < reset_time_s
+            and not events.stop_recording.is_set()
+            and not ctx.runtime.shutdown_event.is_set()
+        ):
+            loop_start = time.perf_counter()
+            obs = robot.get_observation()
+            obs_processed = ctx.processors.robot_observation_processor(obs)
+            teleop_action = teleop.get_action()
+            processed_teleop = ctx.processors.teleop_action_processor((teleop_action, obs))
+            robot_action_to_send = ctx.processors.robot_action_processor((processed_teleop, obs))
+            robot.send_action(robot_action_to_send)
+            self._log_telemetry(obs_processed, processed_teleop, ctx.runtime)
+
+            dt = time.perf_counter() - loop_start
+            if (sleep_t := control_interval - dt) > 0:
+                precise_sleep(sleep_t)
+
+    def _run_model_test_episode_reset(
+        self,
+        ctx: RolloutContext,
+        engine,
+        interpolator,
+        events: DAggerEvents,
+        control_interval: float,
+    ) -> None:
+        """Return to initial pose, allow teleop environment reset, then restart inference."""
+        cfg = ctx.runtime.cfg
+        engine.pause()
+        self._reset_model_test_policy_state(engine, interpolator)
+        events.clear_pending_controls()
+
+        if ctx.hardware.initial_position:
+            self._return_to_initial_position(ctx.hardware)
+
+        log_say("Reset the environment", cfg.play_sounds)
+        self._run_model_test_reset_window(ctx, events, control_interval)
+
+        self._reset_model_test_policy_state(engine, interpolator)
+        events.clear_pending_controls()
+        events.phase = DAggerPhase.AUTONOMOUS
+        engine.resume()
+
+    def _run_continuous(self, ctx: RolloutContext) -> None:
+        """Sentry-like continuous recording with intervention tagging."""
         engine = self._engine
         cfg = ctx.runtime.cfg
         robot = ctx.hardware.robot_wrapper
@@ -465,43 +525,6 @@ class DAggerStrategy(RolloutStrategy):
         episode_duration_s = self._episode_duration_s
         logger.info("DAgger continuous recording started (episode_duration=%.0fs)", episode_duration_s)
 
-        def has_pending_episode_frames() -> bool:
-            return bool(dataset is not None and dataset.has_pending_frames())
-
-        def reset_episode_tracking() -> None:
-            nonlocal episode_start, record_tick
-            episode_start = time.perf_counter()
-            record_tick = 0
-
-        def maybe_save_current_episode(reason: str, elapsed: float | None = None) -> bool:
-            nonlocal episodes_since_push
-            if not has_pending_episode_frames():
-                return False
-
-            with self._episode_lock:
-                dataset.save_episode()
-            episodes_since_push += 1
-            self._needs_push.set()
-            if elapsed is None:
-                logger.info("%s (total: %d)", reason, dataset.num_episodes)
-            else:
-                logger.info("%s (total: %d, elapsed: %.1fs)", reason, dataset.num_episodes, elapsed)
-            log_say(f"Episode {dataset.num_episodes} saved", play_sounds)
-
-            if episodes_since_push >= self.config.upload_every_n_episodes:
-                self._background_push(dataset, cfg)
-                episodes_since_push = 0
-            return True
-
-        def discard_current_episode() -> bool:
-            if not has_pending_episode_frames():
-                return False
-            with self._episode_lock:
-                dataset.clear_episode_buffer()
-            logger.info("In-progress episode discarded")
-            log_say("Re-record episode", play_sounds)
-            return True
-
         with VideoEncodingManager(dataset):
             try:
                 while not events.stop_recording.is_set() and not ctx.runtime.shutdown_event.is_set():
@@ -511,22 +534,6 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
-                    # Manual episode controls are intentionally scoped to the
-                    # in-progress buffer.  Saved episodes on disk are never
-                    # deleted or rolled back.
-                    if events.rerecord_requested.is_set():
-                        events.rerecord_requested.clear()
-                        if not discard_current_episode():
-                            logger.info("Re-record requested, but no in-progress frames were buffered")
-                        reset_episode_tracking()
-
-                    if events.next_episode_requested.is_set():
-                        events.next_episode_requested.clear()
-                        if not maybe_save_current_episode("Episode saved by user"):
-                            logger.info("Next episode requested, but no in-progress frames were buffered")
-                        reset_episode_tracking()
-
-                    # Process transitions
                     transition = events.consume_transition()
                     if transition is not None:
                         old_phase, new_phase = transition
@@ -540,18 +547,60 @@ class DAggerStrategy(RolloutStrategy):
                         )
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
-                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-                            if not maybe_save_current_episode("Correction ended; episode saved"):
-                                logger.info("Correction ended, but no in-progress frames were buffered")
-                            reset_episode_tracking()
+                        if (
+                            self.config.model_test_mode
+                            and old_phase == DAggerPhase.CORRECTING
+                            and new_phase == DAggerPhase.PAUSED
+                        ):
+                            elapsed = time.perf_counter() - episode_start
+                            if self._save_continuous_episode_if_pending(dataset, elapsed, play_sounds):
+                                episodes_since_push = self._after_continuous_episode_saved(
+                                    dataset, cfg, episodes_since_push
+                                )
+                            last_action = None
+                            self._run_model_test_episode_reset(
+                                ctx, engine, interpolator, events, control_interval
+                            )
+                            record_tick = 0
+                            episode_start = time.perf_counter()
+                            continue
+
+                    if events.save_episode_requested.is_set():
+                        events.save_episode_requested.clear()
+                        elapsed = time.perf_counter() - episode_start
+                        saved = self._save_continuous_episode_if_pending(dataset, elapsed, play_sounds)
+                        if saved:
+                            episodes_since_push = self._after_continuous_episode_saved(
+                                dataset, cfg, episodes_since_push
+                            )
+                            episode_start = time.perf_counter()
+                        if self.config.model_test_mode:
+                            last_action = None
+                            self._run_model_test_episode_reset(
+                                ctx, engine, interpolator, events, control_interval
+                            )
+                            record_tick = 0
+                            episode_start = time.perf_counter()
+                            continue
+
+                    if events.discard_episode_requested.is_set():
+                        events.discard_episode_requested.clear()
+                        discarded = self._discard_continuous_episode_if_pending(dataset)
+                        if discarded:
+                            episode_start = time.perf_counter()
+                            record_tick = 0
+                        if self.config.model_test_mode:
+                            last_action = None
+                            self._run_model_test_episode_reset(
+                                ctx, engine, interpolator, events, control_interval
+                            )
+                            record_tick = 0
+                            episode_start = time.perf_counter()
+                            continue
 
                     phase = events.phase
                     obs = robot.get_observation()
 
-                    # --- CORRECTING: human teleop control ---
-                    # TODO(Steven): teleop runs at the same FPS as the policy. To
-                    # decouple the two, sample teleop at its native rate and
-                    # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
@@ -572,12 +621,10 @@ class DAggerStrategy(RolloutStrategy):
                             dataset.add_frame(frame)
                         record_tick += 1
 
-                    # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
                             robot.send_action(last_action)
 
-                    # --- AUTONOMOUS: policy control ---
                     else:
                         obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -600,28 +647,37 @@ class DAggerStrategy(RolloutStrategy):
                                 dataset.add_frame(frame)
                             record_tick += 1
 
-                    # Episode rotation derived from the video file-size target.
-                    # Saving is deferred while a correction is ongoing so the
-                    # episode boundary lands on a clean autonomous frame.
                     elapsed = time.perf_counter() - episode_start
                     if elapsed >= episode_duration_s and phase != DAggerPhase.CORRECTING:
-                        if not maybe_save_current_episode("Episode saved", elapsed):
-                            logger.info("Episode rotation reached, but no in-progress frames were buffered")
-                        reset_episode_tracking()
+                        saved = self._save_continuous_episode_if_pending(dataset, elapsed, play_sounds)
+                        if saved:
+                            episodes_since_push = self._after_continuous_episode_saved(
+                                dataset, cfg, episodes_since_push
+                            )
+                            if self.config.model_test_mode:
+                                last_action = None
+                                self._run_model_test_episode_reset(
+                                    ctx, engine, interpolator, events, control_interval
+                                )
+                                record_tick = 0
+                        episode_start = time.perf_counter()
 
                     dt = time.perf_counter() - loop_start
                     if (sleep_t := control_interval - dt) > 0:
                         precise_sleep(sleep_t)
                     else:
                         logger.warning(
-                            f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                            f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS "
+                            f"({cfg.fps} Hz). Dataset frames might be dropped and robot control might "
+                            "be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy "
+                            "inference taking too long 3) CPU starvation"
                         )
 
             finally:
-                logger.info("DAgger continuous control loop ended — pausing engine")
+                logger.info("DAgger continuous control loop ended -- pausing engine")
                 engine.pause()
                 with contextlib.suppress(Exception):
-                    if has_pending_episode_frames():
+                    if dataset.has_pending_frames():
                         with self._episode_lock:
                             dataset.save_episode()
                         self._needs_push.set()
@@ -632,13 +688,7 @@ class DAggerStrategy(RolloutStrategy):
     # ------------------------------------------------------------------
 
     def _run_corrections_only(self, ctx: RolloutContext) -> None:
-        """Record only human correction windows.  Each correction = one episode.
-
-        The policy runs autonomously without recording.  When the user
-        pauses and starts a correction, frames are recorded with
-        ``intervention=True``.  Stopping the correction saves the episode.
-        The dataset can be uploaded on demand via the upload key/pedal.
-        """
+        """Record only human correction windows.  Each correction = one episode."""
         engine = self._engine
         cfg = ctx.runtime.cfg
         robot = ctx.hardware.robot_wrapper
@@ -679,7 +729,6 @@ class DAggerStrategy(RolloutStrategy):
                         logger.info("Duration limit reached (%.0fs)", cfg.duration)
                         break
 
-                    # Process transitions
                     transition = events.consume_transition()
                     if transition is not None:
                         old_phase, new_phase = transition
@@ -694,20 +743,19 @@ class DAggerStrategy(RolloutStrategy):
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
 
-                        # Correction ended -> save episode (blocking if not streaming)
                         if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-                            with self._episode_lock:
-                                dataset.save_episode()
-                            recorded += 1
-                            self._needs_push.set()
-                            logger.info(
-                                "Correction %d/%d saved",
-                                recorded,
-                                self.config.num_episodes,
-                            )
-                            log_say(f"Correction {recorded} saved", play_sounds)
+                            if dataset.has_pending_frames():
+                                with self._episode_lock:
+                                    dataset.save_episode()
+                                recorded += 1
+                                self._needs_push.set()
+                                logger.info(
+                                    "Correction %d/%d saved",
+                                    recorded,
+                                    self.config.num_episodes,
+                                )
+                                log_say(f"Correction {recorded} saved", play_sounds)
 
-                    # On-demand upload
                     if events.upload_requested.is_set():
                         events.upload_requested.clear()
                         logger.info("Upload requested by user")
@@ -716,10 +764,6 @@ class DAggerStrategy(RolloutStrategy):
                     phase = events.phase
                     obs = robot.get_observation()
 
-                    # --- CORRECTING: human teleop control + recording ---
-                    # TODO(Steven): teleop runs at the same FPS as the policy. To
-                    # decouple the two, sample teleop at its native rate and
-                    # interpolate to the control loop's tick rate.
                     if phase == DAggerPhase.CORRECTING:
                         obs_processed = ctx.processors.robot_observation_processor(obs)
                         teleop_action = teleop.get_action()
@@ -742,12 +786,10 @@ class DAggerStrategy(RolloutStrategy):
                             )
                         record_tick += 1
 
-                    # --- PAUSED: hold position ---
                     elif phase == DAggerPhase.PAUSED:
                         if last_action:
                             robot.send_action(last_action)
 
-                    # --- AUTONOMOUS: policy control (no recording) ---
                     else:
                         obs_processed = self._process_observation_and_notify(ctx.processors, obs)
 
@@ -764,17 +806,21 @@ class DAggerStrategy(RolloutStrategy):
                         precise_sleep(sleep_t)
                     else:
                         logger.warning(
-                            f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS ({cfg.fps} Hz). Dataset frames might be dropped and robot control might be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy inference taking too long 3) CPU starvation"
+                            f"Record loop is running slower ({1 / dt:.1f} Hz) than the target FPS "
+                            f"({cfg.fps} Hz). Dataset frames might be dropped and robot control might "
+                            "be unstable. Common causes are: 1) Camera FPS not keeping up 2) Policy "
+                            "inference taking too long 3) CPU starvation"
                         )
 
             finally:
-                logger.info("DAgger corrections-only loop ended — pausing engine")
+                logger.info("DAgger corrections-only loop ended -- pausing engine")
                 engine.pause()
                 with contextlib.suppress(Exception):
-                    with self._episode_lock:
-                        dataset.save_episode()
-                    self._needs_push.set()
-                    logger.info("Final in-progress episode saved")
+                    if dataset.has_pending_frames():
+                        with self._episode_lock:
+                            dataset.save_episode()
+                        self._needs_push.set()
+                        logger.info("Final in-progress episode saved")
 
     # ------------------------------------------------------------------
     # State-machine transition side-effects
@@ -789,23 +835,7 @@ class DAggerStrategy(RolloutStrategy):
         ctx: RolloutContext,
         prev_action: dict | None,
     ) -> None:
-        """Execute side-effects for a validated phase transition, including smooth handovers.
-
-        AUTONOMOUS -> PAUSED (actuated teleop):
-            Pause the engine, then drive the leader arm to the follower's last
-            commanded position so the operator takes over without a jerk.
-
-        PAUSED -> CORRECTING (non-actuated teleop):
-            Slide the follower to the teleop's current pose so the robot meets
-            the operator's hand rather than jumping to it on the first frame.
-
-        CORRECTING -> PAUSED (actuated teleop):
-            Re-enable torque to hold position after correction.
-            This will be potentially useful if cancelling the correction recording
-
-        PAUSED -> AUTONOMOUS:
-            Reset and resume the inference engine.
-        """
+        """Execute side-effects for a validated phase transition, including smooth handovers."""
         teleop = ctx.hardware.teleop
         robot = ctx.hardware.robot_wrapper
 
@@ -815,11 +845,6 @@ class DAggerStrategy(RolloutStrategy):
             engine.pause()
 
             if _teleop_supports_feedback(teleop) and prev_action is not None:
-                # TODO(Maxime): prev_action is in robot action key space (output of robot_action_processor).
-                # send_feedback expects teleop feedback key space. For homogeneous setups (e.g. SO-101
-                # leader + SO-101 follower) the keys are identical so this works. If the processor pipeline
-                # does non-trivial key renaming (e.g. a rename_map on action keys), the interpolation in
-                # _teleop_smooth_move_to silently no-ops and the arm doesn't move.
                 logger.info("Smooth handover: moving leader arm to follower position")
                 _teleop_smooth_move_to(teleop, prev_action)
 
@@ -833,7 +858,6 @@ class DAggerStrategy(RolloutStrategy):
                 target = ctx.processors.robot_action_processor((processed, obs))
                 _follower_smooth_move_to(robot, prev_action, target)
 
-            # unlock the teleop for human control
             if _teleop_supports_feedback(teleop):
                 teleop.disable_torque()
 
@@ -847,7 +871,6 @@ class DAggerStrategy(RolloutStrategy):
             engine.reset()
             engine.resume()
 
-            # release teleop before resuming the policy
             if _teleop_supports_feedback(teleop):
                 teleop.disable_torque()
 
@@ -856,18 +879,12 @@ class DAggerStrategy(RolloutStrategy):
     # ------------------------------------------------------------------
 
     def _background_push(self, dataset, cfg) -> None:
-        """Queue a Hub push on the single-worker executor.
-
-        The executor's max_workers=1 guarantees at most one push runs at
-        a time; submitted tasks are queued rather than dropped.  Pushes
-        are blocked while the operator is mid-correction to avoid
-        uploading a partially-recorded episode.
-        """
+        """Queue a Hub push on the single-worker executor."""
         if self._push_executor is None:
             return
 
         if self._events.phase == DAggerPhase.CORRECTING:
-            logger.info("Skipping push — correction in progress")
+            logger.info("Skipping push -- correction in progress")
             return
 
         if self._pending_push is not None and not self._pending_push.done():

@@ -42,6 +42,9 @@ class SmolVLAConfig(PreTrainedConfig):
     max_action_dim: int = 32
     # Whether to condition SmolVLA on observation.state.
     use_state: bool = True
+    # Optional training-time input dropout. Currently only supports observation.state.
+    input_dropout_prob: float = 0.0
+    input_dropout_features: list[str] = field(default_factory=list)
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
@@ -134,6 +137,25 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.image_seq_len is not None and self.image_seq_len <= 0:
             raise ValueError(f"`image_seq_len` must be positive when set. Got {self.image_seq_len}.")
+        if not 0.0 <= self.input_dropout_prob <= 1.0:
+            raise ValueError(
+                f"`input_dropout_prob` must be in the range [0.0, 1.0]. Got {self.input_dropout_prob}."
+            )
+        supported_input_dropout_features = {OBS_STATE}
+        unsupported_input_dropout_features = sorted(
+            set(self.input_dropout_features) - supported_input_dropout_features
+        )
+        if unsupported_input_dropout_features:
+            raise ValueError(
+                "`input_dropout_features` contains unsupported feature(s): "
+                f"{unsupported_input_dropout_features}. Supported features: "
+                f"{sorted(supported_input_dropout_features)}."
+            )
+        if OBS_STATE in self.input_dropout_features and not self.use_state:
+            raise ValueError(
+                f"`input_dropout_features` includes `{OBS_STATE}`, but `use_state=False`. "
+                "Set `policy.use_state=true` or remove state input dropout."
+            )
 
     def validate_features(self) -> None:
         if not self.input_features:

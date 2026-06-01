@@ -407,11 +407,23 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         images, img_masks = self.prepare_images(batch)
         state = self.prepare_state(batch)
+        state_dropout_fraction = 0.0
+        if (
+            self.training
+            and self.config.input_dropout_prob > 0.0
+            and OBS_STATE in self.config.input_dropout_features
+            and state is not None
+        ):
+            drop_mask = torch.rand(state.shape[0], device=state.device) < self.config.input_dropout_prob
+            state_dropout_fraction = drop_mask.to(torch.float32).mean().item()
+            if drop_mask.any():
+                state = state.clone()
+                state[drop_mask] = 0
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
-        loss_dict = {}
+        loss_dict = {"state_dropout_fraction": state_dropout_fraction}
         losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]

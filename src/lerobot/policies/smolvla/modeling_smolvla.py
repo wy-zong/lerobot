@@ -423,15 +423,59 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
-        loss_dict = {"state_dropout_fraction": state_dropout_fraction}
-        losses = self.model.forward(images, img_masks, lang_tokens, lang_masks, state, actions, noise, time)
+        training_time_rtc_delay_steps = None
+        training_time_rtc_prefix_mask = None
+        loss_dict = {
+            "state_dropout_fraction": state_dropout_fraction,
+            "training_time_rtc_delay_mean": 0.0,
+            "training_time_rtc_prefix_fraction": 0.0,
+        }
+        if self.training and self.config.training_time_rtc_enabled:
+            training_time_rtc_delay_steps = torch.randint(
+                low=0,
+                high=self.config.training_time_rtc_max_delay_steps + 1,
+                size=(actions.shape[0],),
+                device=actions.device,
+            )
+            action_steps = torch.arange(actions.shape[1], device=actions.device)
+            training_time_rtc_prefix_mask = action_steps[None, :] < training_time_rtc_delay_steps[:, None]
+            loss_dict["training_time_rtc_delay_mean"] = (
+                training_time_rtc_delay_steps.to(torch.float32).mean().item()
+            )
+            loss_dict["training_time_rtc_prefix_fraction"] = (
+                training_time_rtc_prefix_mask.to(torch.float32).mean().item()
+            )
+
+        model_forward_kwargs = {}
+        if training_time_rtc_prefix_mask is not None:
+            model_forward_kwargs = {
+                "training_time_rtc_delay_steps": training_time_rtc_delay_steps,
+                "training_time_rtc_prefix_mask": training_time_rtc_prefix_mask,
+            }
+        losses = self.model.forward(
+            images,
+            img_masks,
+            lang_tokens,
+            lang_masks,
+            state,
+            actions,
+            noise,
+            time,
+            **model_forward_kwargs,
+        )
         original_action_dim = self.config.action_feature.shape[0]
         losses = losses[:, :, :original_action_dim]
         loss_dict["losses_after_forward"] = losses.clone().mean().item()
 
+        valid_loss_mask = None
         if actions_is_pad is not None:
-            in_episode_bound = ~actions_is_pad
-            losses = losses * in_episode_bound.unsqueeze(-1)
+            valid_loss_mask = ~actions_is_pad
+        if training_time_rtc_prefix_mask is not None:
+            postfix_mask = ~training_time_rtc_prefix_mask
+            valid_loss_mask = postfix_mask if valid_loss_mask is None else valid_loss_mask & postfix_mask
+
+        if valid_loss_mask is not None:
+            losses = losses * valid_loss_mask.unsqueeze(-1)
             loss_dict["losses_after_in_ep_bound"] = losses.clone().mean().item()
 
         # Remove padding
@@ -440,19 +484,19 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
         if reduction == "none":
             # Return per-sample losses (B,) by averaging over valid (time, action) entries
-            if actions_is_pad is None:
+            if valid_loss_mask is None:
                 per_sample_loss = losses.mean(dim=(1, 2))
             else:
-                num_valid = ((~actions_is_pad).sum(dim=1) * losses.shape[-1]).clamp_min(1)
+                num_valid = (valid_loss_mask.sum(dim=1) * losses.shape[-1]).clamp_min(1)
                 per_sample_loss = losses.sum(dim=(1, 2)) / num_valid
             loss_dict["loss"] = per_sample_loss.mean().item()
             return per_sample_loss, loss_dict
         else:
             # Default: return scalar mean loss over valid (time, action) entries
-            if actions_is_pad is None:
+            if valid_loss_mask is None:
                 loss = losses.mean()
             else:
-                num_valid = ((~actions_is_pad).sum() * losses.shape[-1]).clamp_min(1)
+                num_valid = (valid_loss_mask.sum() * losses.shape[-1]).clamp_min(1)
                 loss = losses.sum() / num_valid
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
@@ -795,19 +839,35 @@ class VLAFlowMatching(nn.Module):
         # Fuse timestep + action information using an MLP
         action_emb = self.action_in_proj(noisy_actions)
         device = action_emb.device
-        bsize = action_emb.shape[0]
+        bsize, action_time_dim = action_emb.shape[:2]
         dtype = action_emb.dtype
         # Embed timestep using sine-cosine positional encoding with sensitivity in the range [0, 1]
-        time_emb = create_sinusoidal_pos_embedding(
-            timestep,
-            self.vlm_with_expert.expert_hidden_size,
-            self.config.min_period,
-            self.config.max_period,
-            device=device,
-        )
-        time_emb = time_emb.type(dtype=dtype)
-
-        time_emb = time_emb[:, None, :].expand_as(action_emb)
+        if timestep.ndim == 1:
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep,
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.min_period,
+                self.config.max_period,
+                device=device,
+            )
+            time_emb = time_emb.type(dtype=dtype)
+            time_emb = time_emb[:, None, :].expand_as(action_emb)
+        elif timestep.ndim == 2:
+            if timestep.shape != action_emb.shape[:2]:
+                raise ValueError(
+                    "A 2D timestep tensor must have shape `(batch_size, chunk_size)`. "
+                    f"Got {tuple(timestep.shape)} for timestep and {tuple(action_emb.shape[:2])} for actions."
+                )
+            time_emb = create_sinusoidal_pos_embedding(
+                timestep.reshape(-1),
+                self.vlm_with_expert.expert_hidden_size,
+                self.config.min_period,
+                self.config.max_period,
+                device=device,
+            )
+            time_emb = time_emb.type(dtype=dtype).reshape(bsize, action_time_dim, -1)
+        else:
+            raise ValueError("The timestep tensor is expected to be 1D or 2D.")
         action_time_emb = torch.cat([action_emb, time_emb], dim=2)
 
         action_time_emb = self.action_time_mlp_in(action_time_emb)
@@ -817,7 +877,6 @@ class VLAFlowMatching(nn.Module):
         # Add to input tokens
         embs.append(action_time_emb)
 
-        bsize, action_time_dim = action_time_emb.shape[:2]
         action_time_mask = torch.ones(bsize, action_time_dim, dtype=torch.bool, device=device)
         pad_masks.append(action_time_mask)
 
@@ -830,7 +889,17 @@ class VLAFlowMatching(nn.Module):
         return embs, pad_masks, att_masks
 
     def forward(
-        self, images, img_masks, lang_tokens, lang_masks, state: Tensor | None, actions, noise=None, time=None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: Tensor | None,
+        actions,
+        noise=None,
+        time=None,
+        training_time_rtc_delay_steps: Tensor | None = None,
+        training_time_rtc_prefix_mask: Tensor | None = None,
     ) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
         if noise is None:
@@ -839,13 +908,42 @@ class VLAFlowMatching(nn.Module):
         if time is None:
             time = self.sample_time(actions.shape[0], actions.device)
 
+        if training_time_rtc_prefix_mask is None and training_time_rtc_delay_steps is not None:
+            if training_time_rtc_delay_steps.ndim != 1:
+                raise ValueError("`training_time_rtc_delay_steps` must have shape `(batch_size,)`.")
+            if training_time_rtc_delay_steps.shape[0] != actions.shape[0]:
+                raise ValueError(
+                    "`training_time_rtc_delay_steps` batch size must match actions. "
+                    f"Got {training_time_rtc_delay_steps.shape[0]} and {actions.shape[0]}."
+                )
+            action_steps = torch.arange(actions.shape[1], device=actions.device)
+            training_time_rtc_prefix_mask = (
+                action_steps[None, :] < training_time_rtc_delay_steps.to(actions.device)[:, None]
+            )
+        elif training_time_rtc_prefix_mask is not None:
+            if training_time_rtc_prefix_mask.shape != actions.shape[:2]:
+                raise ValueError(
+                    "`training_time_rtc_prefix_mask` must have shape `(batch_size, chunk_size)`. "
+                    f"Got {tuple(training_time_rtc_prefix_mask.shape)} and {tuple(actions.shape[:2])}."
+                )
+            training_time_rtc_prefix_mask = training_time_rtc_prefix_mask.to(
+                device=actions.device, dtype=torch.bool
+            )
+
         time_expanded = time[:, None, None]
         x_t = time_expanded * noise + (1 - time_expanded) * actions
+        suffix_time = time
+        if training_time_rtc_prefix_mask is not None:
+            x_t = torch.where(training_time_rtc_prefix_mask[:, :, None], actions, x_t)
+            suffix_time = time[:, None].expand(-1, actions.shape[1]).clone()
+            suffix_time = torch.where(
+                training_time_rtc_prefix_mask, torch.zeros_like(suffix_time), suffix_time
+            )
         u_t = noise - actions
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
             images, img_masks, lang_tokens, lang_masks, state=state
         )
-        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, time)
+        suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, suffix_time)
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)

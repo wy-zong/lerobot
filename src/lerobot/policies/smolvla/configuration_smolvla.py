@@ -45,6 +45,10 @@ class SmolVLAConfig(PreTrainedConfig):
     # Optional training-time input dropout. Currently only supports observation.state.
     input_dropout_prob: float = 0.0
     input_dropout_features: list[str] = field(default_factory=list)
+    # Optional training-time hard-prefix RTC regularization. Inference-time RTC remains configured
+    # separately through rtc_config.
+    training_time_rtc_enabled: bool = False
+    training_time_rtc_max_delay_steps: int = 12
 
     # Relative actions: converts absolute actions to relative (relative to state).
     use_relative_actions: bool = False
@@ -155,6 +159,18 @@ class SmolVLAConfig(PreTrainedConfig):
             raise ValueError(
                 f"`input_dropout_features` includes `{OBS_STATE}`, but `use_state=False`. "
                 "Set `policy.use_state=true` or remove state input dropout."
+            )
+        if self.training_time_rtc_max_delay_steps < 0:
+            raise ValueError(
+                "`training_time_rtc_max_delay_steps` must be greater than or equal to 0. "
+                f"Got {self.training_time_rtc_max_delay_steps}."
+            )
+        if self.training_time_rtc_enabled and self.training_time_rtc_max_delay_steps >= self.chunk_size:
+            raise ValueError(
+                "`training_time_rtc_max_delay_steps` must be smaller than `chunk_size` when "
+                "`training_time_rtc_enabled=True`. Got "
+                f"{self.training_time_rtc_max_delay_steps} for `training_time_rtc_max_delay_steps` "
+                f"and {self.chunk_size} for `chunk_size`."
             )
 
     def validate_features(self) -> None:

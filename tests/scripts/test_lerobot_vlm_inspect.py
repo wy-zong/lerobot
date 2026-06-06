@@ -20,12 +20,16 @@ import torch
 
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.scripts.lerobot_vlm_inspect import (
+    FeatureSnapshotReference,
     VLMInspectConfig,
+    _representation_delta,
     _resolve_pretrained_name_or_path,
     _run_feature_snapshot,
+    _tensor_delta,
     answer_with_smolvlm,
     ensure_required_state,
     ensure_smolvla_policy_config,
+    trace_smolvla_features,
 )
 from lerobot.utils.constants import (
     OBS_IMAGES,
@@ -89,13 +93,46 @@ def test_feature_mode_requires_real_state_when_policy_uses_state():
         ensure_required_state(policy, {f"{OBS_IMAGES}.front": torch.zeros(1, 3, 8, 8)})
 
 
+def test_tensor_delta_reports_required_metrics():
+    current = torch.tensor([[1.0, 3.0]])
+    reference = torch.tensor([[0.0, 1.0]])
+
+    delta = _tensor_delta(current, reference)
+
+    assert delta["available"]
+    assert delta["shape_compatible"]
+    assert delta["l2"] == pytest.approx(5**0.5)
+    assert delta["mean_abs"] == pytest.approx(1.5)
+    assert delta["max_abs"] == pytest.approx(2.0)
+    assert "cosine_distance" in delta
+
+
+def test_tensor_delta_marks_shape_mismatch_unavailable():
+    delta = _tensor_delta(torch.zeros(1, 2), torch.zeros(1, 3))
+
+    assert not delta["available"]
+    assert not delta["shape_compatible"]
+    assert "shape mismatch" in delta["reason"]
+
+
+def test_representation_delta_handles_missing_references():
+    current = {"prefix_output": torch.ones(1, 2)}
+    reference = FeatureSnapshotReference(tensors={}, action_chunk=torch.zeros(1, 1, 1))
+
+    assert _representation_delta(current, None) == {}
+    delta = _representation_delta(current, reference)
+
+    assert not delta["prefix_output"]["available"]
+    assert delta["prefix_output"]["reason"] == "reference tensor is missing"
+
+
 def test_feature_snapshot_sends_camera_task_and_real_state_to_preprocessor(monkeypatch):
     captured = {}
 
     class FakePolicy:
         config = SimpleNamespace(use_state=True, use_amp=False)
 
-    def fake_trace(policy, batch, *, baseline_action=None, previous_action=None):
+    def fake_trace(policy, batch, *, tensor_dir=None, baseline_reference=None, previous_reference=None):
         captured["trace_batch"] = batch
         return (
             {
@@ -107,7 +144,10 @@ def test_feature_snapshot_sends_camera_task_and_real_state_to_preprocessor(monke
                 "action_chunk": {"shape": [1, 2, 2]},
                 "action_delta": {"baseline": None, "previous": None},
             },
-            torch.ones(1, 2, 2),
+            FeatureSnapshotReference(
+                tensors={"prefix_output": torch.ones(1, 1, 2)},
+                action_chunk=torch.ones(1, 2, 2),
+            ),
         )
 
     def fake_preprocessor(observation):
@@ -144,23 +184,25 @@ def test_feature_snapshot_sends_camera_task_and_real_state_to_preprocessor(monke
         task="pick cube",
         device="cpu",
         robot_type="mock_robot",
-        baseline_action=None,
-        previous_action=None,
+        tensor_dir=None,
+        baseline_reference=None,
+        previous_reference=None,
     )
 
     assert trace["task"] == "pick cube"
     assert trace["image_tokens"][0]["key"] == f"{OBS_IMAGES}.front"
     assert OBS_STATE in captured["trace_batch"]
     torch.testing.assert_close(captured["trace_batch"][OBS_STATE], torch.tensor([[1.0, 2.0]]))
-    torch.testing.assert_close(action_chunk, torch.ones(1, 2, 2))
+    torch.testing.assert_close(action_chunk.action_chunk, torch.ones(1, 2, 2))
     torch.testing.assert_close(postprocessed_action, torch.ones(1, 2, 2))
 
 
 def test_mock_trace_schema_contains_required_feature_sections(monkeypatch):
-    def fake_trace(policy, batch, *, baseline_action=None, previous_action=None):
+    def fake_trace(policy, batch, *, tensor_dir=None, baseline_reference=None, previous_reference=None):
         return (
             {
                 "schema_version": 1,
+                "tensor_artifacts": {"prefix_output": {"path": "tensors/prefix_output.npz"}},
                 "image_tokens": [{"key": f"{OBS_IMAGES}.front", "connector_tokens": {"shape": [1, 4, 8]}}],
                 "language": {"token_count": 4},
                 "state": {"values": [0.1, 0.2]},
@@ -169,8 +211,15 @@ def test_mock_trace_schema_contains_required_feature_sections(monkeypatch):
                 "expert_attention": {"language": {"mean_mass": 0.25}},
                 "action_chunk": {"shape": [1, 2, 3]},
                 "action_delta": {"baseline": {"available": True}, "previous": None},
+                "representation_delta": {
+                    "baseline": {"prefix_output": {"available": True}},
+                    "previous": {},
+                },
             },
-            torch.zeros(1, 2, 3),
+            FeatureSnapshotReference(
+                tensors={"prefix_output": torch.zeros(1, 5, 8)},
+                action_chunk=torch.zeros(1, 2, 3),
+            ),
         )
 
     monkeypatch.setattr(
@@ -199,11 +248,16 @@ def test_mock_trace_schema_contains_required_feature_sections(monkeypatch):
         task="inspect",
         device="cpu",
         robot_type="mock_robot",
-        baseline_action=torch.zeros(1, 2, 3),
-        previous_action=None,
+        tensor_dir=None,
+        baseline_reference=FeatureSnapshotReference(
+            tensors={"prefix_output": torch.zeros(1, 5, 8)},
+            action_chunk=torch.zeros(1, 2, 3),
+        ),
+        previous_reference=None,
     )
 
     for key in (
+        "tensor_artifacts",
         "image_tokens",
         "language",
         "state",
@@ -212,8 +266,161 @@ def test_mock_trace_schema_contains_required_feature_sections(monkeypatch):
         "expert_attention",
         "action_chunk",
         "action_delta",
+        "representation_delta",
     ):
         assert key in trace
+
+
+class _FakeActionOutProj:
+    def __call__(self, suffix_out):
+        return suffix_out
+
+
+class _FakeTraceVLMWithExpert:
+    def embed_image(self, image):
+        value = image.to(dtype=torch.float32).mean(dim=(1, 2, 3))
+        return value[:, None, None].expand(image.shape[0], 2, 3).contiguous()
+
+    def forward(
+        self,
+        *,
+        attention_mask,
+        position_ids,
+        past_key_values,
+        inputs_embeds,
+        use_cache,
+        fill_kv_cache,
+        trace=None,
+    ):
+        if fill_kv_cache:
+            prefix_embs = inputs_embeds[0]
+            cache = {
+                0: {
+                    "key_states": prefix_embs[:, :, None, :],
+                    "value_states": (prefix_embs + 1.0)[:, :, None, :],
+                }
+            }
+            if trace is not None:
+                trace.setdefault("prefix_hidden_states", []).append(
+                    {"layer": 0, "shape": list(prefix_embs.shape)}
+                )
+            return [prefix_embs + 2.0, None], cache
+
+        suffix_embs = inputs_embeds[1]
+        return [None, suffix_embs + 0.5], past_key_values
+
+
+class _FakeTraceFlow:
+    def __init__(self, config):
+        self.config = config
+        self.vlm_with_expert = _FakeTraceVLMWithExpert()
+        self.action_out_proj = _FakeActionOutProj()
+        self.add_image_special_tokens = False
+        self.rtc_processor = None
+        self.sample_noise_calls = 0
+
+    def _rtc_enabled(self):
+        return False
+
+    def sample_noise(self, shape, device):
+        self.sample_noise_calls += 1
+        return torch.full(shape, 0.25, device=device)
+
+    def embed_prefix(self, images, img_masks, lang_tokens, lang_masks, state=None):
+        image_embs = [self.vlm_with_expert.embed_image(image) for image in images]
+        lang_embs = lang_tokens.to(dtype=torch.float32)[:, :, None].expand(-1, -1, 3)
+        prefix_embs = torch.cat([*image_embs, lang_embs], dim=1)
+        prefix_pad_masks = torch.ones(prefix_embs.shape[:2], dtype=torch.bool, device=prefix_embs.device)
+        prefix_att_masks = torch.zeros(prefix_embs.shape[:2], dtype=torch.bool, device=prefix_embs.device)
+        return prefix_embs, prefix_pad_masks, prefix_att_masks
+
+    def embed_suffix(self, noisy_actions, timestep):
+        suffix_embs = noisy_actions + timestep[:, None, None]
+        suffix_pad_masks = torch.ones(noisy_actions.shape[:2], dtype=torch.bool, device=noisy_actions.device)
+        suffix_att_masks = torch.ones(noisy_actions.shape[:2], dtype=torch.bool, device=noisy_actions.device)
+        return suffix_embs, suffix_pad_masks, suffix_att_masks
+
+
+class _FakeTracePolicy:
+    def __init__(self):
+        self.config = SimpleNamespace(
+            use_state=False,
+            image_features={f"{OBS_IMAGES}.front": SimpleNamespace()},
+            chunk_size=2,
+            max_action_dim=2,
+            num_steps=2,
+            use_cache=True,
+            action_feature=SimpleNamespace(shape=(2,)),
+            adapt_to_pi_aloha=False,
+        )
+        self.model = _FakeTraceFlow(self.config)
+
+    def eval(self):
+        return self
+
+    def _prepare_batch(self, batch):
+        return batch
+
+    def prepare_images(self, batch):
+        key = f"{OBS_IMAGES}.front"
+        return [batch[key]], [torch.ones(batch[key].shape[0], dtype=torch.bool)]
+
+    def prepare_state(self, batch):
+        return None
+
+    def predict_action_chunk(self, batch):
+        raise AssertionError("trace_smolvla_features must not rerun predict_action_chunk")
+
+
+def _fake_trace_batch(image_value=0.0):
+    return {
+        f"{OBS_IMAGES}.front": torch.full((1, 3, 4, 4), image_value),
+        OBS_LANGUAGE_TOKENS: torch.tensor([[1, 2, 3]]),
+        OBS_LANGUAGE_ATTENTION_MASK: torch.ones(1, 3, dtype=torch.bool),
+    }
+
+
+def test_trace_writes_tensor_artifacts_and_uses_instrumented_inference(tmp_path):
+    policy = _FakeTracePolicy()
+
+    trace1, reference1 = trace_smolvla_features(
+        policy,
+        _fake_trace_batch(0.0),
+        tensor_dir=tmp_path / "snapshot_0001" / "tensors",
+    )
+    trace2, _reference2 = trace_smolvla_features(
+        policy,
+        _fake_trace_batch(1.0),
+        tensor_dir=tmp_path / "snapshot_0002" / "tensors",
+        baseline_reference=reference1,
+        previous_reference=reference1,
+    )
+
+    assert policy.model.sample_noise_calls == 2
+    torch.testing.assert_close(
+        reference1.action_chunk,
+        torch.full((1, 2, 2), -0.8125),
+    )
+    for artifact_name in (
+        "image_connector_tokens",
+        "prefix_output",
+        "prefix_kv_cache",
+        "suffix_out_steps",
+    ):
+        artifact = trace1["tensor_artifacts"][artifact_name]
+        assert artifact["path"] == f"tensors/{artifact_name}.npz"
+        assert (tmp_path / "snapshot_0001" / artifact["path"]).exists()
+        assert artifact["arrays"]
+
+    suffix_artifact = trace1["tensor_artifacts"]["suffix_out_steps"]["arrays"]["suffix_out_steps"]
+    assert suffix_artifact["shape"] == [2, 1, 2, 2]
+    assert suffix_artifact["step_count"] == 2
+    image_delta = trace2["representation_delta"]["baseline"][f"image_connector_tokens:{OBS_IMAGES}.front"]
+    assert image_delta["available"]
+    assert image_delta["mean_abs"] > 0
+    assert trace2["representation_delta"]["previous"][f"image_connector_tokens:{OBS_IMAGES}.front"][
+        "available"
+    ]
 
 
 class _FakeInputs(dict):

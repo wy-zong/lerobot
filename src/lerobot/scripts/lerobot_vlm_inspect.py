@@ -121,6 +121,18 @@ class InspectEvents:
     selected_camera_index: int = 0
 
 
+@dataclass
+class FeatureSnapshotReference:
+    tensors: dict[str, torch.Tensor]
+    action_chunk: torch.Tensor
+
+    def clone(self) -> "FeatureSnapshotReference":
+        return FeatureSnapshotReference(
+            tensors={key: value.detach().cpu().clone() for key, value in self.tensors.items()},
+            action_chunk=self.action_chunk.detach().cpu().clone(),
+        )
+
+
 def ensure_smolvla_policy_config(policy_cfg: Any) -> None:
     if not isinstance(policy_cfg, SmolVLAConfig):
         policy_type = getattr(policy_cfg, "type", type(policy_cfg).__name__)
@@ -251,18 +263,153 @@ def _tensor_values(value: Any, max_items: int = 128) -> list[float]:
     return [float(v) for v in flat.tolist()]
 
 
-def _action_delta(current: torch.Tensor, reference: torch.Tensor | None) -> dict[str, Any] | None:
+def _tensor_delta(current: torch.Tensor, reference: torch.Tensor | None) -> dict[str, Any] | None:
     if reference is None:
         return None
     current_cpu = current.detach().cpu().to(dtype=torch.float32)
     reference_cpu = reference.detach().cpu().to(dtype=torch.float32)
+    current_dtype = str(current.detach().dtype).removeprefix("torch.")
+    reference_dtype = str(reference.detach().dtype).removeprefix("torch.")
     if list(current_cpu.shape) != list(reference_cpu.shape):
         return {
             "available": False,
+            "shape_compatible": False,
+            "dtype_compatible": current_dtype == reference_dtype,
+            "current_shape": list(current_cpu.shape),
+            "reference_shape": list(reference_cpu.shape),
+            "current_dtype": current_dtype,
+            "reference_dtype": reference_dtype,
             "reason": f"shape mismatch current={list(current_cpu.shape)} reference={list(reference_cpu.shape)}",
         }
     delta = current_cpu - reference_cpu
-    return {"available": True, **_tensor_summary(delta), "mean_abs": float(delta.abs().mean().item())}
+    current_flat = current_cpu.flatten()
+    reference_flat = reference_cpu.flatten()
+    denominator = torch.linalg.vector_norm(current_flat) * torch.linalg.vector_norm(reference_flat)
+    if denominator.item() == 0:
+        cosine_distance = 0.0 if torch.equal(current_flat, reference_flat) else 1.0
+    else:
+        cosine_distance = float(1.0 - torch.dot(current_flat, reference_flat).item() / denominator.item())
+    return {
+        "available": True,
+        "shape_compatible": True,
+        "dtype_compatible": current_dtype == reference_dtype,
+        "current_shape": list(current_cpu.shape),
+        "reference_shape": list(reference_cpu.shape),
+        "current_dtype": current_dtype,
+        "reference_dtype": reference_dtype,
+        "l2": float(torch.linalg.vector_norm(delta).item()),
+        "mean_abs": float(delta.abs().mean().item()) if delta.numel() else 0.0,
+        "max_abs": float(delta.abs().max().item()) if delta.numel() else 0.0,
+        "cosine_distance": cosine_distance,
+    }
+
+
+def _representation_delta(
+    current: dict[str, torch.Tensor],
+    reference: FeatureSnapshotReference | None,
+) -> dict[str, Any]:
+    if reference is None:
+        return {}
+
+    deltas = {}
+    for key, current_tensor in current.items():
+        reference_tensor = reference.tensors.get(key)
+        if reference_tensor is None:
+            deltas[key] = {
+                "available": False,
+                "shape_compatible": False,
+                "dtype_compatible": False,
+                "current_shape": list(current_tensor.shape),
+                "reference_shape": None,
+                "current_dtype": str(current_tensor.dtype).removeprefix("torch."),
+                "reference_dtype": None,
+                "reason": "reference tensor is missing",
+            }
+            continue
+        deltas[key] = _tensor_delta(current_tensor, reference_tensor)
+    return deltas
+
+
+def _action_delta(current: torch.Tensor, reference: FeatureSnapshotReference | None) -> dict[str, Any] | None:
+    if reference is None:
+        return None
+    return _tensor_delta(current, reference.action_chunk)
+
+
+def _safe_npz_array_name(name: str) -> str:
+    safe = "".join(char if char.isalnum() else "_" for char in name)
+    safe = "_".join(part for part in safe.split("_") if part)
+    return safe or "tensor"
+
+
+def _tensor_to_storage_array(tensor: torch.Tensor) -> tuple[np.ndarray, dict[str, Any]]:
+    tensor_cpu = tensor.detach().cpu().contiguous()
+    original_dtype = str(tensor_cpu.dtype).removeprefix("torch.")
+    if tensor_cpu.dtype == torch.bfloat16:
+        try:
+            storage = tensor_cpu.view(torch.uint16).numpy()
+            return storage, {
+                "dtype": original_dtype,
+                "storage_dtype": str(storage.dtype),
+                "encoding": "torch.bfloat16_bits",
+            }
+        except RuntimeError:
+            storage = tensor_cpu.to(dtype=torch.float32).numpy()
+            return storage, {
+                "dtype": original_dtype,
+                "storage_dtype": str(storage.dtype),
+                "encoding": "float32_upcast_from_bfloat16",
+            }
+
+    storage = tensor_cpu.numpy()
+    return storage, {
+        "dtype": original_dtype,
+        "storage_dtype": str(storage.dtype),
+        "encoding": "native",
+    }
+
+
+def _artifact_display_path(path: Path, tensor_dir: Path) -> str:
+    try:
+        display_path = path.relative_to(tensor_dir.parent)
+    except ValueError:
+        display_path = path
+    return display_path.as_posix()
+
+
+def _save_tensor_artifact(
+    tensor_dir: Path | None,
+    *,
+    filename: str,
+    arrays: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    metadata = {"path": None, "arrays": {}}
+    storage_arrays = {}
+    for array_name, array_info in arrays.items():
+        tensor = array_info["tensor"]
+        summary = _tensor_summary(tensor)
+        storage_array, storage_info = _tensor_to_storage_array(tensor)
+        storage_arrays[array_name] = storage_array
+        metadata["arrays"][array_name] = {key: value for key, value in array_info.items() if key != "tensor"}
+        metadata["arrays"][array_name].update(
+            {
+                "shape": summary["shape"],
+                "dtype": summary["dtype"],
+                "summary": summary,
+                "storage": storage_info,
+            }
+        )
+
+    if tensor_dir is not None:
+        tensor_dir.mkdir(parents=True, exist_ok=True)
+        path = tensor_dir / filename
+        np.savez_compressed(path, **storage_arrays)
+        metadata["path"] = _artifact_display_path(path, tensor_dir)
+    return metadata
+
+
+def _clone_reference_tensors(tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {key: value.detach().cpu().clone() for key, value in tensors.items()}
 
 
 def _prepare_snapshot_for_policy(
@@ -276,6 +423,44 @@ def _prepare_snapshot_for_policy(
     observation = copy(observation_frame)
     observation = prepare_observation_for_inference(observation, torch.device(device), task, robot_type)
     return preprocessor(observation)
+
+
+def _denoise_step_with_suffix_out(
+    flow: Any,
+    *,
+    prefix_pad_masks: torch.Tensor,
+    past_key_values: dict[int, dict[str, torch.Tensor]],
+    x_t: torch.Tensor,
+    timestep: torch.Tensor,
+    trace: dict[str, Any] | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    suffix_embs, suffix_pad_masks, suffix_att_masks = flow.embed_suffix(x_t, timestep)
+
+    suffix_len = suffix_pad_masks.shape[1]
+    batch_size = prefix_pad_masks.shape[0]
+    prefix_len = prefix_pad_masks.shape[1]
+    prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+
+    suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+
+    full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+    prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+    position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+    outputs_embeds, _ = flow.vlm_with_expert.forward(
+        attention_mask=full_att_2d_masks,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        inputs_embeds=[None, suffix_embs],
+        use_cache=flow.config.use_cache,
+        fill_kv_cache=False,
+        trace=trace,
+    )
+    suffix_out = outputs_embeds[1]
+    suffix_out = suffix_out[:, -flow.config.chunk_size :]
+    suffix_out = suffix_out.to(dtype=torch.float32)
+    v_t = flow.action_out_proj(suffix_out)
+    return v_t, suffix_out
 
 
 def _image_to_uint8_hwc(image: Any) -> np.ndarray:
@@ -315,14 +500,15 @@ def trace_smolvla_features(
     policy: SmolVLAPolicy,
     batch: dict[str, Any],
     *,
-    baseline_action: torch.Tensor | None = None,
-    previous_action: torch.Tensor | None = None,
-) -> tuple[dict[str, Any], torch.Tensor]:
+    tensor_dir: Path | None = None,
+    baseline_reference: FeatureSnapshotReference | None = None,
+    previous_reference: FeatureSnapshotReference | None = None,
+) -> tuple[dict[str, Any], FeatureSnapshotReference]:
     ensure_required_state(policy, batch)
     policy.eval()
     batch = policy._prepare_batch(dict(batch))
 
-    with torch.inference_mode():
+    with torch.no_grad():
         images, img_masks = policy.prepare_images(batch)
         state = policy.prepare_state(batch)
         lang_tokens = batch[OBS_LANGUAGE_TOKENS]
@@ -331,6 +517,8 @@ def trace_smolvla_features(
         flow = policy.model
         image_keys = [key for key in policy.config.image_features if key in batch]
         image_summaries = []
+        image_connector_arrays: dict[str, dict[str, Any]] = {}
+        reference_tensors: dict[str, torch.Tensor] = {}
         token_groups: dict[str, tuple[int, int]] = {}
         offset = 0
         for image_index, (image, img_mask) in enumerate(zip(images, img_masks, strict=False)):
@@ -346,6 +534,17 @@ def trace_smolvla_features(
             if flow.add_image_special_tokens:
                 offset += int(flow.image_end_token.numel())
             token_groups[f"image:{camera_key}"] = (group_start, offset)
+            reference_key = f"image_connector_tokens:{camera_key}"
+            array_name = _safe_npz_array_name(reference_key)
+            reference_tensors[reference_key] = image_tokens.detach().cpu().clone()
+            image_connector_arrays[array_name] = {
+                "tensor": image_tokens,
+                "key": reference_key,
+                "camera_key": camera_key,
+                "token_group": [group_start, offset],
+                "connector_token_range": [token_start, token_start + image_tokens.shape[1]],
+                "mask": [bool(v) for v in img_mask.detach().cpu().flatten().tolist()],
+            }
             image_summaries.append(
                 {
                     "key": camera_key,
@@ -378,7 +577,7 @@ def trace_smolvla_features(
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
-        _, past_key_values = flow.vlm_with_expert.forward(
+        prefix_outputs, past_key_values = flow.vlm_with_expert.forward(
             attention_mask=prefix_att_2d_masks,
             position_ids=prefix_position_ids,
             past_key_values=None,
@@ -387,29 +586,134 @@ def trace_smolvla_features(
             fill_kv_cache=True,
             trace=trace_runtime,
         )
+        prefix_output = prefix_outputs[0]
+        reference_tensors["prefix_output"] = prefix_output.detach().cpu().clone()
 
-        action_shape = (
-            lang_tokens.shape[0],
-            policy.config.chunk_size,
-            policy.config.max_action_dim,
-        )
-        noise = flow.sample_noise(action_shape, lang_tokens.device)
-        timestep = torch.ones(lang_tokens.shape[0], dtype=torch.float32, device=lang_tokens.device)
-        _ = flow.denoise_step(
-            prefix_pad_masks=prefix_pad_masks,
-            past_key_values=past_key_values,
-            x_t=noise,
-            timestep=timestep,
-            trace=trace_runtime,
-        )
+        prefix_kv_arrays: dict[str, dict[str, Any]] = {}
+        if past_key_values is not None:
+            for layer_idx in sorted(past_key_values):
+                layer_cache = past_key_values[layer_idx]
+                for cache_name in ("key_states", "value_states"):
+                    cache_tensor = layer_cache[cache_name]
+                    reference_key = f"prefix_kv_cache:layer_{int(layer_idx):04d}:{cache_name}"
+                    array_name = _safe_npz_array_name(reference_key)
+                    reference_tensors[reference_key] = cache_tensor.detach().cpu().clone()
+                    prefix_kv_arrays[array_name] = {
+                        "tensor": cache_tensor,
+                        "key": reference_key,
+                        "layer": int(layer_idx),
+                        "cache": cache_name,
+                        "token_groups": {key: list(value) for key, value in token_groups.items()},
+                    }
 
-        action_chunk = policy.predict_action_chunk(batch)
+        if state is not None:
+            bsize = state.shape[0]
+            device = state.device
+        else:
+            bsize = lang_tokens.shape[0]
+            device = lang_tokens.device
+
+        action_shape = (bsize, policy.config.chunk_size, policy.config.max_action_dim)
+        noise = flow.sample_noise(action_shape, device)
+        num_steps = policy.config.num_steps
+        dt = -1.0 / num_steps
+
+        x_t = noise
+        suffix_out_steps = []
+        for step in range(num_steps):
+            time_value = 1.0 + step * dt
+            time_tensor = torch.tensor(time_value, dtype=torch.float32, device=device).expand(bsize)
+            step_suffix_out = None
+
+            def denoise_step_partial_call(
+                input_x_t: torch.Tensor, current_timestep: torch.Tensor = time_tensor
+            ) -> torch.Tensor:
+                nonlocal step_suffix_out
+                v_t, suffix_out = _denoise_step_with_suffix_out(
+                    flow,
+                    prefix_pad_masks=prefix_pad_masks,
+                    past_key_values=past_key_values,
+                    x_t=input_x_t,
+                    timestep=current_timestep,
+                    trace=trace_runtime,
+                )
+                step_suffix_out = suffix_out
+                return v_t
+
+            if flow._rtc_enabled():
+                v_t = flow.rtc_processor.denoise_step(
+                    x_t=x_t,
+                    prev_chunk_left_over=None,
+                    inference_delay=None,
+                    time=time_value,
+                    original_denoise_step_partial=denoise_step_partial_call,
+                    execution_horizon=None,
+                )
+            else:
+                v_t = denoise_step_partial_call(x_t)
+
+            x_t = x_t + dt * v_t
+            if step_suffix_out is not None:
+                suffix_out_steps.append(step_suffix_out.detach().cpu().clone())
+
+            if flow.rtc_processor is not None and flow.rtc_processor.is_debug_enabled():
+                flow.rtc_processor.track(time=time_value, x_t=x_t, v_t=v_t)
+
+        if suffix_out_steps:
+            suffix_out_steps_tensor = torch.stack(suffix_out_steps, dim=0)
+        else:
+            suffix_out_steps_tensor = torch.empty(0, device=device)
+        reference_tensors["suffix_out_steps"] = suffix_out_steps_tensor.detach().cpu().clone()
+
+        action_chunk = x_t[:, :, : policy.config.action_feature.shape[0]]
+        if policy.config.adapt_to_pi_aloha:
+            action_chunk = policy._pi_aloha_encode_actions(action_chunk)
+        action_chunk = action_chunk.detach().cpu()
 
     language_mask = lang_masks.detach().cpu().to(dtype=torch.bool)
     language_tokens = lang_tokens.detach().cpu()
+    token_groups_json = {key: list(value) for key, value in token_groups.items()}
+    tensor_artifacts = {
+        "image_connector_tokens": _save_tensor_artifact(
+            tensor_dir,
+            filename="image_connector_tokens.npz",
+            arrays=image_connector_arrays,
+        ),
+        "prefix_output": _save_tensor_artifact(
+            tensor_dir,
+            filename="prefix_output.npz",
+            arrays={
+                "prefix_output": {
+                    "tensor": prefix_output,
+                    "key": "prefix_output",
+                    "token_groups": token_groups_json,
+                }
+            },
+        ),
+        "prefix_kv_cache": _save_tensor_artifact(
+            tensor_dir,
+            filename="prefix_kv_cache.npz",
+            arrays=prefix_kv_arrays,
+        ),
+        "suffix_out_steps": _save_tensor_artifact(
+            tensor_dir,
+            filename="suffix_out_steps.npz",
+            arrays={
+                "suffix_out_steps": {
+                    "tensor": suffix_out_steps_tensor,
+                    "key": "suffix_out_steps",
+                    "step_count": len(suffix_out_steps),
+                    "action_token_range": [0, policy.config.chunk_size],
+                }
+            },
+        ),
+    }
+    reference_tensors = _clone_reference_tensors(reference_tensors)
+    reference = FeatureSnapshotReference(tensors=reference_tensors, action_chunk=action_chunk.clone())
     trace = {
         "schema_version": 1,
         "mode": "feature",
+        "tensor_artifacts": tensor_artifacts,
         "image_tokens": image_summaries,
         "language": {
             "token_count": int(language_mask.sum().item()),
@@ -418,17 +722,21 @@ def trace_smolvla_features(
         },
         "state": state_summary,
         "state_embedding": state_embedding_summary,
-        "token_groups": {key: list(value) for key, value in token_groups.items()},
+        "token_groups": token_groups_json,
         "prefix_hidden_states": trace_runtime.get("prefix_hidden_states", [])[:16],
         "expert_attention": _aggregate_attention_by_group(trace_runtime.get("attention", [])),
         "attention_calls": trace_runtime.get("attention", []),
         "action_chunk": _tensor_summary(action_chunk),
         "action_delta": {
-            "baseline": _action_delta(action_chunk, baseline_action),
-            "previous": _action_delta(action_chunk, previous_action),
+            "baseline": _action_delta(action_chunk, baseline_reference),
+            "previous": _action_delta(action_chunk, previous_reference),
+        },
+        "representation_delta": {
+            "baseline": _representation_delta(reference_tensors, baseline_reference),
+            "previous": _representation_delta(reference_tensors, previous_reference),
         },
     }
-    return trace, action_chunk.detach().cpu()
+    return trace, reference
 
 
 def answer_with_smolvlm(
@@ -506,6 +814,14 @@ def _log_trace_to_rerun(trace: dict[str, Any], snapshot_index: int) -> None:
     for delta_name, delta in trace.get("action_delta", {}).items():
         if delta and delta.get("available") and "l2" in delta:
             rr.log(f"vlm_inspect/action_delta/{delta_name}_l2", rr.Scalars(float(delta["l2"])))
+    for reference_name, deltas in trace.get("representation_delta", {}).items():
+        for tensor_name, delta in deltas.items():
+            if delta and delta.get("available") and "l2" in delta:
+                safe_tensor_name = _safe_npz_array_name(tensor_name)
+                rr.log(
+                    f"vlm_inspect/representation_delta/{reference_name}/{safe_tensor_name}_l2",
+                    rr.Scalars(float(delta["l2"])),
+                )
     rr.log("vlm_inspect/snapshot_index", rr.Scalars(float(snapshot_index)))
 
 
@@ -556,9 +872,10 @@ def _run_feature_snapshot(
     task: str,
     device: str,
     robot_type: str,
-    baseline_action: torch.Tensor | None,
-    previous_action: torch.Tensor | None,
-) -> tuple[dict[str, Any], torch.Tensor, torch.Tensor | None]:
+    tensor_dir: Path | None,
+    baseline_reference: FeatureSnapshotReference | None,
+    previous_reference: FeatureSnapshotReference | None,
+) -> tuple[dict[str, Any], FeatureSnapshotReference, torch.Tensor | None]:
     preprocessed = _prepare_snapshot_for_policy(
         observation_frame,
         task=task,
@@ -566,20 +883,21 @@ def _run_feature_snapshot(
         robot_type=robot_type,
         preprocessor=preprocessor,
     )
-    trace, action_chunk = trace_smolvla_features(
+    trace, reference = trace_smolvla_features(
         policy,
         preprocessed,
-        baseline_action=baseline_action,
-        previous_action=previous_action,
+        tensor_dir=tensor_dir,
+        baseline_reference=baseline_reference,
+        previous_reference=previous_reference,
     )
     try:
-        postprocessed_action = postprocessor(action_chunk.to(device))
+        postprocessed_action = postprocessor(reference.action_chunk.to(device))
         trace["postprocessed_action_chunk"] = _tensor_summary(postprocessed_action)
     except Exception as exc:
         trace["postprocessed_action_chunk"] = {"available": False, "reason": str(exc)}
         postprocessed_action = None
     trace["task"] = task
-    return trace, action_chunk, postprocessed_action
+    return trace, reference, postprocessed_action
 
 
 @parser.wrap()
@@ -622,9 +940,9 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
     events = InspectEvents()
     listener = _start_keyboard_listener(events)
     mode = cfg.mode
-    baseline_action = None
+    baseline_reference = None
     baseline_next_capture = False
-    previous_action = None
+    previous_reference = None
     snapshot_index = 0
     control_interval = 1 / cfg.fps
 
@@ -654,11 +972,11 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                 print(f"Mode: {mode}")
 
             if events.set_baseline:
-                if previous_action is None:
+                if previous_reference is None:
                     print("No feature snapshot yet; next feature capture will become the baseline.")
                     baseline_next_capture = True
                 else:
-                    baseline_action = previous_action.clone()
+                    baseline_reference = previous_reference.clone()
                     print("Baseline set to previous feature snapshot.")
                 events.set_baseline = False
 
@@ -678,7 +996,7 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                         else nullcontext()
                     )
                     with autocast_ctx:
-                        trace, action_chunk, _postprocessed_action = _run_feature_snapshot(
+                        trace, reference, _postprocessed_action = _run_feature_snapshot(
                             policy=policy,
                             preprocessor=preprocessor,
                             postprocessor=postprocessor,
@@ -686,16 +1004,17 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                             task=task,
                             device=cfg.device,
                             robot_type=robot.name,
-                            baseline_action=baseline_action,
-                            previous_action=previous_action,
+                            tensor_dir=snapshot_dir / "tensors",
+                            baseline_reference=baseline_reference,
+                            previous_reference=previous_reference,
                         )
-                    if baseline_action is None and previous_action is None:
+                    if baseline_reference is None and previous_reference is None:
                         print(
                             "First feature snapshot captured. Press b after a later capture to set a baseline."
                         )
-                    previous_action = action_chunk.clone()
+                    previous_reference = reference.clone()
                     if baseline_next_capture:
-                        baseline_action = action_chunk.clone()
+                        baseline_reference = reference.clone()
                         baseline_next_capture = False
                         print("Baseline set to current feature snapshot.")
                     _write_json(snapshot_dir / "trace.json", trace)

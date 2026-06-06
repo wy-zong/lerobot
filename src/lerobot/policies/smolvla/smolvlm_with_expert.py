@@ -15,7 +15,7 @@
 import copy
 import logging
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch import nn
@@ -96,6 +96,64 @@ def get_intermediate_size(hidden_dim, ffn_dim_multiplier=4, multiple_of=256):
     hidden_dim = int(ffn_dim_multiplier * hidden_dim)
     hidden_dim = multiple_of * ((hidden_dim + multiple_of - 1) // multiple_of)
     return hidden_dim
+
+
+def _summarize_tensor_for_trace(tensor: torch.Tensor) -> dict[str, Any]:
+    tensor = tensor.detach()
+    tensor_float = tensor.to(dtype=torch.float32)
+    if tensor_float.numel() == 0:
+        return {
+            "shape": list(tensor.shape),
+            "dtype": str(tensor.dtype).removeprefix("torch."),
+            "device": str(tensor.device),
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "l2": 0.0,
+        }
+
+    return {
+        "shape": list(tensor.shape),
+        "dtype": str(tensor.dtype).removeprefix("torch."),
+        "device": str(tensor.device),
+        "mean": float(tensor_float.mean().item()),
+        "std": float(tensor_float.std(unbiased=False).item()) if tensor_float.numel() > 1 else 0.0,
+        "min": float(tensor_float.min().item()),
+        "max": float(tensor_float.max().item()),
+        "l2": float(torch.linalg.vector_norm(tensor_float).item()),
+    }
+
+
+def _record_attention_for_trace(
+    trace: dict[str, Any] | None,
+    trace_context: dict[str, Any] | None,
+    probs: torch.Tensor,
+    key_length: int,
+) -> None:
+    if trace is None or trace_context is None:
+        return
+
+    probs_float = probs.detach().to(dtype=torch.float32)
+    group_mass = {}
+    for group_name, bounds in trace.get("token_groups", {}).items():
+        start, end = int(bounds[0]), int(bounds[1])
+        start = max(start, 0)
+        end = min(end, key_length)
+        if start >= end:
+            continue
+        group_mass[group_name] = float(probs_float[..., start:end].sum(dim=-1).mean().item())
+
+    total_group_mass = sum(group_mass.values())
+    attention_entry = {
+        **trace_context,
+        "query_length": int(probs.shape[-2]),
+        "key_length": int(key_length),
+        "group_mass": group_mass,
+        "total_group_mass": float(total_group_mass),
+        "ungrouped_mass": float(max(0.0, 1.0 - total_group_mass)),
+    }
+    trace.setdefault("attention", []).append(attention_entry)
 
 
 class SmolVLMWithExpertModel(nn.Module):
@@ -261,6 +319,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        trace: dict[str, Any] | None = None,
     ) -> list[torch.Tensor]:
         query_states = []
         key_states = []
@@ -322,7 +381,19 @@ class SmolVLMWithExpertModel(nn.Module):
         attention_interface = self.get_attention_interface()
 
         att_output = attention_interface(
-            attention_mask_, batch_size, head_dim, query_states, key_states, value_states
+            attention_mask_,
+            batch_size,
+            head_dim,
+            query_states,
+            key_states,
+            value_states,
+            trace=trace,
+            trace_context={
+                "layer": int(layer_idx),
+                "kind": "self",
+                "fill_kv_cache": bool(fill_kv_cache),
+                "attention_mask_shape": list(attention_mask_.shape),
+            },
         )
         return [att_output], past_key_values
 
@@ -338,6 +409,7 @@ class SmolVLMWithExpertModel(nn.Module):
         use_cache: bool = True,
         fill_kv_cache: bool = True,
         past_key_values=None,
+        trace: dict[str, Any] | None = None,
     ) -> list[torch.Tensor]:
         attention_interface = self.get_attention_interface()
 
@@ -369,7 +441,19 @@ class SmolVLMWithExpertModel(nn.Module):
             key_states = apply_rope(key_state, position_id)
 
             att_output = attention_interface(
-                prefix_attention_mask, batch_size, head_dim, query_states, key_states, value_states
+                prefix_attention_mask,
+                batch_size,
+                head_dim,
+                query_states,
+                key_states,
+                value_states,
+                trace=trace,
+                trace_context={
+                    "layer": int(layer_idx),
+                    "kind": "prefix_self",
+                    "fill_kv_cache": bool(fill_kv_cache),
+                    "attention_mask_shape": list(prefix_attention_mask.shape),
+                },
             )
             att_outputs.append(att_output)
         else:
@@ -433,6 +517,13 @@ class SmolVLMWithExpertModel(nn.Module):
                 expert_query_states,
                 expert_key_states,
                 expert_value_states,
+                trace=trace,
+                trace_context={
+                    "layer": int(layer_idx),
+                    "kind": "expert_cross",
+                    "fill_kv_cache": bool(fill_kv_cache),
+                    "attention_mask_shape": list(expert_attention_mask.shape),
+                },
             )
             att_outputs.append(att_output)
         else:
@@ -463,6 +554,7 @@ class SmolVLMWithExpertModel(nn.Module):
         inputs_embeds: list[torch.FloatTensor] = None,
         use_cache: bool | None = None,
         fill_kv_cache: bool | None = None,
+        trace: dict[str, Any] | None = None,
     ):
         models = [self.get_vlm_model().text_model, self.lm_expert]
         model_layers = self.get_model_layers(models)
@@ -494,6 +586,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    trace=trace,
                 )
             else:
                 att_outputs, past_key_values = self.forward_cross_attn_layer(
@@ -507,6 +600,7 @@ class SmolVLMWithExpertModel(nn.Module):
                     use_cache=use_cache,
                     fill_kv_cache=fill_kv_cache,
                     past_key_values=past_key_values,
+                    trace=trace,
                 )
             outputs_embeds = []
             start = 0
@@ -541,6 +635,10 @@ class SmolVLMWithExpertModel(nn.Module):
                     outputs_embeds.append(None)
 
             inputs_embeds = outputs_embeds
+            if trace is not None and inputs_embeds[0] is not None:
+                trace.setdefault("prefix_hidden_states", []).append(
+                    {"layer": int(layer_idx), **_summarize_tensor_for_trace(inputs_embeds[0])}
+                )
 
         # final norm
         outputs_embeds = []
@@ -557,7 +655,15 @@ class SmolVLMWithExpertModel(nn.Module):
         return attention_interface
 
     def eager_attention_forward(
-        self, attention_mask, batch_size, head_dim, query_states, key_states, value_states
+        self,
+        attention_mask,
+        batch_size,
+        head_dim,
+        query_states,
+        key_states,
+        value_states,
+        trace: dict[str, Any] | None = None,
+        trace_context: dict[str, Any] | None = None,
     ):
         num_att_heads = self.num_attention_heads
         num_key_value_heads = self.num_key_value_heads
@@ -593,6 +699,7 @@ class SmolVLMWithExpertModel(nn.Module):
         big_neg = torch.finfo(att_weights.dtype).min  # -2.3819763e38  # See gemma/modules.py
         masked_att_weights = torch.where(attention_mask[:, None, :, :], att_weights, big_neg)
         probs = nn.functional.softmax(masked_att_weights, dim=-1)
+        _record_attention_for_trace(trace, trace_context, probs, sequence_length)
         probs = probs.to(dtype=value_states.dtype)
 
         att_output = torch.matmul(probs, value_states.permute(0, 2, 1, 3))

@@ -1046,6 +1046,7 @@ class VLAFlowMatching(nn.Module):
         past_key_values,
         x_t,
         timestep,
+        trace: dict | None = None,
     ):
         """Apply one denoising step of the noise `x_t` at a given timestep."""
         suffix_embs, suffix_pad_masks, suffix_att_masks = self.embed_suffix(x_t, timestep)
@@ -1068,6 +1069,7 @@ class VLAFlowMatching(nn.Module):
             inputs_embeds=[None, suffix_embs],
             use_cache=self.config.use_cache,
             fill_kv_cache=False,
+            trace=trace,
         )
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.chunk_size :]

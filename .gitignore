@@ -176,3 +176,6 @@ outputs/
 *.urdf
 *.xml
 *.part
+convert_pdf_to_md.py
+scripts/evaluate_action_chunk_loss.py
+scripts/evaluate_task_prompt_sensitivity.py

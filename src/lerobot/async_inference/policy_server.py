@@ -29,6 +29,7 @@ import pickle  # nosec
 import threading
 import time
 from concurrent import futures
+from contextlib import nullcontext
 from dataclasses import asdict
 from pprint import pformat
 from queue import Empty, Queue
@@ -38,6 +39,7 @@ import draccus
 import grpc
 import torch
 
+from lerobot.configs import PreTrainedConfig
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.processor import PolicyProcessorPipeline
 from lerobot.transport import (
@@ -147,10 +149,16 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.actions_per_chunk = policy_specs.actions_per_chunk
 
         policy_class = get_policy_class(self.policy_type)
+        policy_config = PreTrainedConfig.from_pretrained(policy_specs.pretrained_name_or_path)
+        policy_config.device = self.device
+        if hasattr(policy_config, "compile_model"):
+            policy_config.compile_model = self.config.use_torch_compile
+            self.logger.info("Policy compile_model set to %s", policy_config.compile_model)
 
         start = time.perf_counter()
-        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
+        self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path, config=policy_config)
         self.policy.to(self.device)
+        self.policy.eval()
 
         # Load preprocessor and postprocessor, overriding device to match requested device
         device_override = {"device": self.device}
@@ -346,37 +354,42 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         )
         prepare_time = time.perf_counter() - start_prepare
 
-        """2. Apply preprocessor"""
-        start_preprocess = time.perf_counter()
-        observation = self.preprocessor(observation)
-        self.last_processed_obs: TimedObservation = observation_t
-        preprocessing_time = time.perf_counter() - start_preprocess
-
-        """3. Get action chunk"""
-        start_inference = time.perf_counter()
-        action_tensor = self._get_action_chunk(observation)
-        inference_time = time.perf_counter() - start_inference
-        self.logger.info(
-            f"Preprocessing and inference took {inference_time:.4f}s, action shape: {action_tensor.shape}"
+        autocast_ctx = (
+            torch.autocast(device_type=torch.device(self.device).type)
+            if torch.device(self.device).type == "cuda" and self.policy.config.use_amp
+            else nullcontext()
         )
 
-        """4. Apply postprocessor"""
-        # Apply postprocessor (handles unnormalization and device movement)
-        # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
-        # So we process each action in the chunk individually
-        start_postprocess = time.perf_counter()
-        _, chunk_size, _ = action_tensor.shape
+        with torch.inference_mode(), autocast_ctx:
+            """2. Apply preprocessor"""
+            start_preprocess = time.perf_counter()
+            observation = self.preprocessor(observation)
+            self.last_processed_obs: TimedObservation = observation_t
+            preprocessing_time = time.perf_counter() - start_preprocess
 
-        # Process each action in the chunk
-        processed_actions = []
-        for i in range(chunk_size):
-            # Extract action at timestep i: (B, action_dim)
-            single_action = action_tensor[:, i, :]
-            processed_action = self.postprocessor(single_action)
-            processed_actions.append(processed_action)
+            """3. Get action chunk"""
+            start_inference = time.perf_counter()
+            action_tensor = self._get_action_chunk(observation)
+            inference_time = time.perf_counter() - start_inference
+            self.logger.info(f"Inference took {inference_time:.4f}s, action shape: {action_tensor.shape}")
 
-        # Stack back to (B, chunk_size, action_dim), then remove batch dim
-        action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
+            """4. Apply postprocessor"""
+            # Apply postprocessor (handles unnormalization and device movement)
+            # Postprocessor expects (B, action_dim) per action, but we have (B, chunk_size, action_dim)
+            # So we process each action in the chunk individually
+            start_postprocess = time.perf_counter()
+            _, chunk_size, _ = action_tensor.shape
+
+            # Process each action in the chunk
+            processed_actions = []
+            for i in range(chunk_size):
+                # Extract action at timestep i: (B, action_dim)
+                single_action = action_tensor[:, i, :]
+                processed_action = self.postprocessor(single_action)
+                processed_actions.append(processed_action)
+
+            # Stack back to (B, chunk_size, action_dim), then remove batch dim
+            action_tensor = torch.stack(processed_actions, dim=1).squeeze(0)
         self.logger.debug(f"Postprocessed action shape: {action_tensor.shape}")
 
         action_tensor = action_tensor.detach().cpu()

@@ -17,6 +17,7 @@ Monkey-patch the `policy` attribute with a stub so that no real model inference 
 
 from __future__ import annotations
 
+import pickle  # nosec
 import time
 
 import pytest
@@ -217,3 +218,76 @@ def test_predict_action_chunk(monkeypatch, policy_server):
     for i, ta in enumerate(timed_actions):
         expected_ts = obs.get_timestamp() + i * policy_server.config.environment_dt
         assert abs(ta.get_timestamp() - expected_ts) < 1e-6
+
+
+@pytest.mark.parametrize("use_torch_compile", [False, True])
+def test_send_policy_instructions_overrides_compile_model(monkeypatch, use_torch_compile):
+    """Async server should not inherit checkpoint compile_model unless explicitly enabled."""
+    from lerobot.async_inference import policy_server as policy_server_module
+    from lerobot.async_inference.configs import PolicyServerConfig
+    from lerobot.async_inference.helpers import RemotePolicyConfig
+    from lerobot.async_inference.policy_server import PolicyServer
+    from lerobot.transport import services_pb2
+
+    class FakeContext:
+        def peer(self):
+            return "fake-client"
+
+    class FakePolicyConfig:
+        device = "cpu"
+        compile_model = True
+        image_features = {}
+
+    class FakePolicy:
+        def __init__(self, config):
+            self.config = config
+            self.eval_called = False
+
+        @classmethod
+        def from_pretrained(cls, pretrained_name_or_path, config=None):
+            assert pretrained_name_or_path == "fake/model"
+            return cls(config)
+
+        def to(self, device):
+            self.to_device = device
+            return self
+
+        def eval(self):
+            self.eval_called = True
+            return self
+
+    class FakePreTrainedConfig:
+        @staticmethod
+        def from_pretrained(pretrained_name_or_path):
+            assert pretrained_name_or_path == "fake/model"
+            return FakePolicyConfig()
+
+    monkeypatch.setattr(policy_server_module, "PreTrainedConfig", FakePreTrainedConfig)
+    monkeypatch.setattr(policy_server_module, "get_policy_class", lambda policy_type: FakePolicy)
+    monkeypatch.setattr(
+        policy_server_module,
+        "make_pre_post_processors",
+        lambda *args, **kwargs: (lambda obs: obs, lambda action: action),
+    )
+
+    server = PolicyServer(
+        PolicyServerConfig(host="localhost", port=9999, use_torch_compile=use_torch_compile)
+    )
+    request = services_pb2.PolicySetup(
+        data=pickle.dumps(
+            RemotePolicyConfig(
+                policy_type="smolvla",
+                pretrained_name_or_path="fake/model",
+                lerobot_features={},
+                actions_per_chunk=50,
+                device="cuda",
+            )
+        )
+    )
+
+    server.SendPolicyInstructions(request, FakeContext())
+
+    assert server.policy.config.device == "cuda"
+    assert server.policy.config.compile_model is use_torch_compile
+    assert server.policy.to_device == "cuda"
+    assert server.policy.eval_called

@@ -64,6 +64,11 @@ class PolicyServerConfig:
         default=DEFAULT_OBS_QUEUE_TIMEOUT, metadata={"help": "Timeout for observation queue in seconds"}
     )
 
+    use_torch_compile: bool = field(
+        default=False,
+        metadata={"help": "Whether to honor policy compile_model settings for server-side inference"},
+    )
+
     def __post_init__(self):
         """Validate configuration after initialization."""
         if self.port < 1 or self.port > 65535:
@@ -96,6 +101,7 @@ class PolicyServerConfig:
             "fps": self.fps,
             "environment_dt": self.environment_dt,
             "inference_latency": self.inference_latency,
+            "use_torch_compile": self.use_torch_compile,
         }
 
 

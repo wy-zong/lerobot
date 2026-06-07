@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from collections.abc import MutableMapping
 from types import SimpleNamespace
 
 import numpy as np
@@ -69,6 +70,29 @@ def test_config_disables_compile_model_for_inspection():
 
     assert cfg.policy is not None
     assert not cfg.policy.compile_model
+
+
+def test_capture_once_requires_question():
+    with pytest.raises(ValueError, match="--question"):
+        VLMInspectConfig(
+            robot=SimpleNamespace(type="mock"),
+            policy=SmolVLAConfig(device="cpu"),
+            device="cpu",
+            capture_once=True,
+        )
+
+
+def test_camera_only_answer_requires_answer_capture_once():
+    with pytest.raises(ValueError, match="--camera_only_answer"):
+        VLMInspectConfig(
+            robot=SimpleNamespace(type="mock"),
+            policy=SmolVLAConfig(device="cpu"),
+            device="cpu",
+            mode="feature",
+            capture_once=True,
+            question="inspect",
+            camera_only_answer=True,
+        )
 
 
 def test_hub_policy_path_preserves_forward_slash():
@@ -423,13 +447,49 @@ def test_trace_writes_tensor_artifacts_and_uses_instrumented_inference(tmp_path)
     ]
 
 
-class _FakeInputs(dict):
+class _FakeInputs(MutableMapping):
+    def __init__(self, data):
+        self.data = data
+
+    def __getitem__(self, key):
+        return self.data[key]
+
+    def __setitem__(self, key, value):
+        self.data[key] = value
+
+    def __delitem__(self, key):
+        del self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
     def to(self, device):
         self["device"] = device
         return self
 
 
+class _FakeTokenizer:
+    def __call__(self, text, add_special_tokens=False):
+        assert not add_special_tokens
+        token_ids = {
+            "yes": [5],
+            "Yes": [5],
+            " YES": [5],
+            " yes": [5],
+            "no": [6],
+            "No": [6],
+            " NO": [6],
+            " no": [6],
+        }
+        return {"input_ids": token_ids.get(text, [0])}
+
+
 class _FakeProcessor:
+    tokenizer = _FakeTokenizer()
+
     def apply_chat_template(self, messages, add_generation_prompt=True):
         assert add_generation_prompt
         return messages[0]["content"][1]["text"]
@@ -442,30 +502,42 @@ class _FakeProcessor:
 
     def batch_decode(self, output_ids, skip_special_tokens=True):
         assert skip_special_tokens
+        torch.testing.assert_close(output_ids, torch.tensor([[9, 10]]))
         return ["a red cube"]
 
 
 class _FakeVLM:
     config = SimpleNamespace(text_config=SimpleNamespace(num_hidden_layers=2))
 
+    def __init__(self):
+        self.generate_calls = 0
+
+    def __call__(self, **kwargs):
+        logits = torch.zeros(1, kwargs["input_ids"].shape[-1], 16)
+        logits[0, -1, 5] = 3.0
+        logits[0, -1, 6] = 1.0
+        return SimpleNamespace(logits=logits)
+
     def generate(self, **kwargs):
+        self.generate_calls += 1
         assert kwargs["max_new_tokens"] == 64
         return torch.tensor([[1, 1, 9, 10]])
 
 
 class _FakeVLMWithExpert:
     processor = _FakeProcessor()
-    vlm = _FakeVLM()
 
     def __init__(self, loaded_layers=2):
         self._loaded_layers = loaded_layers
+        self.vlm = _FakeVLM()
 
     def get_vlm_model(self):
         return SimpleNamespace(text_model=SimpleNamespace(layers=[object()] * self._loaded_layers))
 
 
 def test_answer_mode_generates_when_full_vlm_available():
-    policy = SimpleNamespace(model=SimpleNamespace(vlm_with_expert=_FakeVLMWithExpert()))
+    vlm_with_expert = _FakeVLMWithExpert()
+    policy = SimpleNamespace(model=SimpleNamespace(vlm_with_expert=vlm_with_expert))
 
     result = answer_with_smolvlm(
         policy,
@@ -474,7 +546,36 @@ def test_answer_mode_generates_when_full_vlm_available():
         device="cpu",
     )
 
-    assert result == {"available": True, "answer": "a red cube", "reason": None}
+    assert result["available"]
+    assert result["answer"] == "a red cube"
+    assert result["reason"] is None
+    assert result["input_token_count"] == 2
+    assert result["generated_token_count"] == 2
+    assert result["prompt_echo_removed"]
+    assert result["yes_no"]["available"]
+    assert result["yes_no"]["label"] == "yes"
+    assert result["yes_no"]["yes_probability"] > result["yes_no"]["no_probability"]
+    assert not result["generation_skipped"]
+    assert vlm_with_expert.vlm.generate_calls == 1
+
+
+def test_answer_mode_score_only_skips_generation():
+    vlm_with_expert = _FakeVLMWithExpert()
+    policy = SimpleNamespace(model=SimpleNamespace(vlm_with_expert=vlm_with_expert))
+
+    result = answer_with_smolvlm(
+        policy,
+        np.zeros((8, 8, 3), dtype=np.uint8),
+        "what is visible?",
+        device="cpu",
+        generate_answer=False,
+    )
+
+    assert result["available"]
+    assert result["answer"] == "yes"
+    assert result["generated_token_count"] == 0
+    assert result["generation_skipped"]
+    assert vlm_with_expert.vlm.generate_calls == 0
 
 
 def test_answer_mode_unavailable_for_truncated_vlm():

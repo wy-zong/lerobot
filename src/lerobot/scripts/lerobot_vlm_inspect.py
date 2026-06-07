@@ -84,12 +84,21 @@ class VLMInspectConfig:
     display_compressed_images: bool = False
     output_dir: Path = Path("outputs/vlm_inspect")
     rename_map: dict[str, str] = field(default_factory=dict)
+    capture_once: bool = False
+    question: str | None = None
+    answer_max_new_tokens: int = 16
+    camera_only_answer: bool = False
+    answer_score_only: bool = False
 
     def __post_init__(self) -> None:
         if self.robot is None:
             raise ValueError("--robot.type is required for lerobot-vlm-inspect")
         if self.mode not in {"feature", "answer"}:
             raise ValueError(f"--mode must be either 'feature' or 'answer', got '{self.mode}'.")
+        if self.capture_once and self.question is None:
+            raise ValueError("--question is required when --capture_once=true.")
+        if self.camera_only_answer and (self.mode != "answer" or not self.capture_once):
+            raise ValueError("--camera_only_answer=true requires --mode=answer and --capture_once=true.")
 
         policy_path = parser.get_path_arg("policy")
         if policy_path:
@@ -746,6 +755,7 @@ def answer_with_smolvlm(
     *,
     device: str,
     max_new_tokens: int = 64,
+    generate_answer: bool = True,
 ) -> dict[str, Any]:
     vlm_with_expert = getattr(policy.model, "vlm_with_expert", None)
     if vlm_with_expert is None:
@@ -776,14 +786,122 @@ def answer_with_smolvlm(
             text = prompt
         inputs = processor(text=text, images=[image_hwc], return_tensors="pt")
         inputs = inputs.to(device) if hasattr(inputs, "to") else {k: v.to(device) for k, v in inputs.items()}
-        with torch.inference_mode():
-            output_ids = vlm.generate(**inputs, max_new_tokens=max_new_tokens)
-        input_len = inputs["input_ids"].shape[-1] if isinstance(inputs, dict) and "input_ids" in inputs else 0
-        answer_ids = output_ids[:, input_len:] if input_len else output_ids
-        answer = processor.batch_decode(answer_ids, skip_special_tokens=True)[0].strip()
-        return {"available": True, "answer": answer, "reason": None}
+        input_len = _model_input_token_count(inputs)
+        yes_no = _score_yes_no_from_next_token(vlm, processor, inputs)
+        if generate_answer:
+            with torch.inference_mode():
+                output_ids = vlm.generate(**inputs, max_new_tokens=max_new_tokens)
+            answer_ids, prompt_echo_removed = _generated_answer_ids(output_ids, input_len)
+            answer = processor.batch_decode(answer_ids, skip_special_tokens=True)[0].strip()
+            generated_token_count = int(answer_ids.shape[-1]) if hasattr(answer_ids, "shape") else None
+        else:
+            answer = yes_no.get("label") if yes_no.get("available") else None
+            generated_token_count = 0
+            prompt_echo_removed = False
+        return {
+            "available": bool(answer is not None or generate_answer),
+            "answer": answer,
+            "reason": None if answer is not None or generate_answer else yes_no.get("reason"),
+            "input_token_count": input_len,
+            "generated_token_count": generated_token_count,
+            "prompt_echo_removed": prompt_echo_removed,
+            "generation_skipped": not generate_answer,
+            "yes_no": yes_no,
+        }
     except Exception as exc:
         return {"available": False, "answer": None, "reason": str(exc)}
+
+
+def _model_input_value(inputs: Any, key: str) -> Any | None:
+    try:
+        return inputs[key]
+    except (AttributeError, KeyError, TypeError):
+        return getattr(inputs, key, None)
+
+
+def _model_input_token_count(inputs: Any) -> int:
+    input_ids = _model_input_value(inputs, "input_ids")
+    if input_ids is None or not hasattr(input_ids, "shape") or len(input_ids.shape) == 0:
+        return 0
+    return int(input_ids.shape[-1])
+
+
+def _generated_answer_ids(output_ids: torch.Tensor, input_len: int) -> tuple[torch.Tensor, bool]:
+    if input_len <= 0 or not hasattr(output_ids, "shape") or output_ids.shape[-1] < input_len:
+        return output_ids, False
+    return output_ids[:, input_len:], True
+
+
+def _tokenizer_input_ids(tokenizer: Any, text: str) -> list[int]:
+    try:
+        encoded = tokenizer(text, add_special_tokens=False)
+        ids = encoded["input_ids"] if isinstance(encoded, dict) else getattr(encoded, "input_ids", encoded)
+    except Exception:
+        try:
+            ids = tokenizer.encode(text, add_special_tokens=False)
+        except Exception:
+            return []
+
+    if isinstance(ids, torch.Tensor):
+        ids = ids.detach().cpu().tolist()
+    if ids and isinstance(ids[0], list):
+        ids = ids[0]
+    return [int(token_id) for token_id in ids]
+
+
+def _candidate_first_token_ids(tokenizer: Any, candidates: tuple[str, ...]) -> list[int]:
+    token_ids = []
+    for candidate in candidates:
+        ids = _tokenizer_input_ids(tokenizer, candidate)
+        if ids:
+            token_ids.append(ids[0])
+    return sorted(set(token_ids))
+
+
+def _score_yes_no_from_next_token(vlm: Any, processor: Any, inputs: Any) -> dict[str, Any]:
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is None:
+        return {"available": False, "reason": "Processor has no tokenizer."}
+
+    yes_ids = _candidate_first_token_ids(tokenizer, ("yes", "Yes", " YES", " yes"))
+    no_ids = _candidate_first_token_ids(tokenizer, ("no", "No", " NO", " no"))
+    if not yes_ids or not no_ids:
+        return {"available": False, "reason": "Could not encode yes/no candidate tokens."}
+
+    try:
+        with torch.inference_mode():
+            outputs = vlm(**inputs)
+        logits = getattr(outputs, "logits", None)
+        if logits is None:
+            return {"available": False, "reason": "VLM forward output has no logits."}
+
+        next_logits = logits[:, -1, :].float()
+        vocab_size = next_logits.shape[-1]
+        yes_ids = [token_id for token_id in yes_ids if token_id < vocab_size]
+        no_ids = [token_id for token_id in no_ids if token_id < vocab_size]
+        if not yes_ids or not no_ids:
+            return {"available": False, "reason": "Encoded yes/no token ids exceed logits vocabulary."}
+
+        yes_score = torch.logsumexp(next_logits[0, yes_ids], dim=0)
+        no_score = torch.logsumexp(next_logits[0, no_ids], dim=0)
+        yes_no_probs = torch.softmax(torch.stack([yes_score, no_score]), dim=0)
+        yes_probability = float(yes_no_probs[0].item())
+        no_probability = float(yes_no_probs[1].item())
+        margin = float((yes_score - no_score).item())
+        return {
+            "available": True,
+            "label": "yes" if margin >= 0 else "no",
+            "yes_probability": yes_probability,
+            "no_probability": no_probability,
+            "yes_logit_score": float(yes_score.item()),
+            "no_logit_score": float(no_score.item()),
+            "margin": margin,
+            "yes_token_ids": yes_ids,
+            "no_token_ids": no_ids,
+            "note": "Probability is normalized only over yes/no first-token candidates.",
+        }
+    except Exception as exc:
+        return {"available": False, "reason": str(exc)}
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -863,6 +981,69 @@ def _print_camera_selection(camera_keys: list[str], selected_index: int) -> None
     print(f"Selected camera: {selected}")
 
 
+def _camera_only_entries(robot: Robot) -> list[tuple[str, Any]]:
+    if hasattr(robot, "left_arm") and hasattr(robot, "right_arm"):
+        entries = []
+        for prefix, arm in (("left_", robot.left_arm), ("right_", robot.right_arm)):
+            entries.extend((f"{OBS_IMAGES}.{prefix}{key}", camera) for key, camera in arm.cameras.items())
+        return entries
+    return [(f"{OBS_IMAGES}.{key}", camera) for key, camera in getattr(robot, "cameras", {}).items()]
+
+
+def _run_camera_only_answer_capture(
+    *,
+    cfg: VLMInspectConfig,
+    policy: SmolVLAPolicy,
+    robot: Robot,
+    run_dir: Path,
+) -> None:
+    if cfg.question is None:
+        raise ValueError("--question is required for camera-only answer capture.")
+
+    camera_entries = _camera_only_entries(robot)
+    if not camera_entries:
+        raise ValueError("No cameras configured on robot.")
+
+    connected_cameras = []
+    snapshot_index = 1
+    snapshot_dir = run_dir / f"snapshot_{snapshot_index:04d}"
+    try:
+        observation_frame = {}
+        selected_key, selected_camera = camera_entries[0]
+        _print_camera_selection([key for key, _camera in camera_entries], 0)
+        selected_camera.connect()
+        connected_cameras.append(selected_camera)
+        observation_frame[selected_key] = selected_camera.read()
+
+        _save_snapshot_arrays(snapshot_dir, observation_frame)
+        answer = answer_with_smolvlm(
+            policy,
+            observation_frame[selected_key],
+            cfg.question,
+            device=cfg.device,
+            max_new_tokens=cfg.answer_max_new_tokens,
+            generate_answer=not cfg.answer_score_only,
+        )
+        answer["camera"] = selected_key
+        _write_json(snapshot_dir / "answer.json", answer)
+        if answer.get("available"):
+            print(f"Answer: {answer['answer']}")
+            yes_no = answer.get("yes_no", {})
+            if yes_no.get("available"):
+                print(
+                    "Yes/no: "
+                    f"{yes_no['label']} "
+                    f"(yes={yes_no['yes_probability']:.3f}, "
+                    f"no={yes_no['no_probability']:.3f}, "
+                    f"margin={yes_no['margin']:.3f})"
+                )
+        else:
+            print(f"Answer unavailable: {answer.get('reason')}")
+    finally:
+        for camera in reversed(connected_cameras):
+            camera.disconnect()
+
+
 def _run_feature_snapshot(
     *,
     policy: SmolVLAPolicy,
@@ -929,13 +1110,19 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
 
     _teleop_action_processor, _robot_action_processor, robot_observation_processor = make_default_processors()
     robot = make_robot_from_config(cfg.robot)
-    robot.connect()
     _validate_visual_features(policy_cfg, robot, cfg.rename_map)
-    observation_features = _build_observation_features(robot, robot_observation_processor)
 
     run_dir = cfg.output_dir / datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_json(run_dir / "config.json", asdict(cfg))
+
+    if cfg.camera_only_answer:
+        _run_camera_only_answer_capture(cfg=cfg, policy=policy, robot=robot, run_dir=run_dir)
+        logger.info("VLM inspection finished. Outputs: %s", run_dir)
+        return
+
+    robot.connect()
+    observation_features = _build_observation_features(robot, robot_observation_processor)
 
     events = InspectEvents()
     listener = _start_keyboard_listener(events)
@@ -980,11 +1167,16 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                     print("Baseline set to previous feature snapshot.")
                 events.set_baseline = False
 
+            if cfg.capture_once and snapshot_index == 0:
+                events.capture = True
+
             if events.capture:
                 events.capture = False
                 snapshot = copy(observation_frame)
                 _print_camera_selection(camera_keys, events.selected_camera_index)
-                task = input("Task / question: ")
+                task = cfg.question if cfg.capture_once else input("Task / question: ")
+                if task is None:
+                    raise ValueError("Task / question is required.")
                 snapshot_index += 1
                 snapshot_dir = run_dir / f"snapshot_{snapshot_index:04d}"
                 _save_snapshot_arrays(snapshot_dir, snapshot)
@@ -1031,6 +1223,8 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                             snapshot[selected_key],
                             task,
                             device=cfg.device,
+                            max_new_tokens=cfg.answer_max_new_tokens,
+                            generate_answer=not cfg.answer_score_only,
                         )
                         answer["camera"] = selected_key
                     _write_json(snapshot_dir / "answer.json", answer)
@@ -1038,6 +1232,9 @@ def vlm_inspect(cfg: VLMInspectConfig) -> None:
                         print(f"Answer: {answer['answer']}")
                     else:
                         print(f"Answer unavailable: {answer.get('reason')}")
+
+                if cfg.capture_once:
+                    events.exit = True
 
             dt = time.perf_counter() - loop_start
             precise_sleep(max(control_interval - dt, 0.0))

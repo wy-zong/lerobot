@@ -120,6 +120,15 @@ class SARMEncodingProcessorStep(ProcessorStep):
         self.verbs = ["move", "grasp", "rotate", "push", "pull", "slide", "lift", "place"]
         self.fake = Faker()
 
+        self.precomputed_image_features = None
+        self.clip_zero_pad_vec = None
+        if self.config.precomputed_image_features_path is not None:
+            self.precomputed_image_features = np.load(
+                self.config.precomputed_image_features_path, mmap_mode="r"
+            )
+            zero_image = np.zeros((1, 1, 3, 224, 224), dtype=np.uint8)
+            self.clip_zero_pad_vec = self._encode_images_batch(zero_image).squeeze().numpy()
+
     def _find_episode_for_frame(self, frame_idx: int) -> int:
         """Find the episode index for a given frame index."""
         for ep_idx in range(len(self.dataset_meta.episodes)):
@@ -211,19 +220,25 @@ class SARMEncodingProcessorStep(ProcessorStep):
         frame_indices = np.atleast_1d(np.asarray(from_tensor_to_numpy(frame_index)))
         episode_indices = self._get_episode_indices(frame_indices, episode_index)
 
-        image = observation.get(self.image_key)
-        if isinstance(image, torch.Tensor):
-            image = image.cpu().numpy()
+        image = None
+        if self.precomputed_image_features is None:
+            image = observation.get(self.image_key)
+            if isinstance(image, torch.Tensor):
+                image = image.cpu().numpy()
 
-        # If 4D (T, C, H, W) from delta_timestamps, add batch dim
-        # If 3D (C, H, W) single frame, add batch and time dims
-        if image.ndim == 4:
-            image = image[np.newaxis, ...]  # (T, C, H, W) -> (1, T, C, H, W)
-        elif image.ndim == 3:
-            image = image[np.newaxis, np.newaxis, ...]  # (C, H, W) -> (1, 1, C, H, W)
+            # If 4D (T, C, H, W) from delta_timestamps, add batch dim
+            # If 3D (C, H, W) single frame, add batch and time dims
+            if image.ndim == 4:
+                image = image[np.newaxis, ...]  # (T, C, H, W) -> (1, T, C, H, W)
+            elif image.ndim == 3:
+                image = image[np.newaxis, np.newaxis, ...]  # (C, H, W) -> (1, 1, C, H, W)
 
-        batch_size = image.shape[0]
-        total_frames = image.shape[1]  # Should be 13: 9 obs + 4 rewind placeholders
+            batch_size = image.shape[0]
+            total_frames = image.shape[1]  # Should be 13: 9 obs + 4 rewind placeholders
+        else:
+            batch_size = len(frame_indices)
+            total_frames = self.config.num_frames
+
         n_obs_steps = self.config.n_obs_steps
         max_rewind_steps = self.config.max_rewind_steps
         n_obs_frames = 1 + n_obs_steps  # 9 observation frames (including current)
@@ -249,13 +264,41 @@ class SARMEncodingProcessorStep(ProcessorStep):
 
         # Apply rewind masking to images
         # For frames beyond valid length, we mask with zeros (or copy last valid frame)
-        for b_idx in range(batch_size):
-            valid_len = lengths[b_idx].item()
-            if valid_len < total_frames:
-                image[b_idx, valid_len:] = 0  # Zero out frames beyond valid length
+        if image is not None:
+            for b_idx in range(batch_size):
+                valid_len = lengths[b_idx].item()
+                if valid_len < total_frames:
+                    image[b_idx, valid_len:] = 0  # Zero out frames beyond valid length
 
         # Encode images with CLIP
-        video_features = self._encode_images_batch(image)
+        if self.precomputed_image_features is None:
+            video_features = self._encode_images_batch(image)
+        else:
+            delta_indices = self.config.observation_delta_indices
+            if len(delta_indices) != total_frames:
+                raise ValueError(f"delta_indices ({len(delta_indices)}) != total_frames ({total_frames})")
+
+            abs_indices = np.empty((batch_size, total_frames), dtype=np.int64)
+            for b_idx in range(batch_size):
+                center = int(frame_indices[b_idx])
+                ep_idx = int(episode_indices[b_idx])
+                ep_start = int(self.dataset_meta.episodes[ep_idx]["dataset_from_index"])
+                ep_end = int(self.dataset_meta.episodes[ep_idx]["dataset_to_index"])
+                for t_idx, delta in enumerate(delta_indices):
+                    idx = center + int(delta)
+                    if idx < ep_start:
+                        idx = ep_start
+                    elif idx >= ep_end:
+                        idx = ep_end - 1
+                    abs_indices[b_idx, t_idx] = idx
+
+            feats = np.asarray(self.precomputed_image_features[abs_indices]).copy()
+            for b_idx in range(batch_size):
+                valid_len = lengths[b_idx].item()
+                if valid_len < total_frames:
+                    feats[b_idx, valid_len:] = self.clip_zero_pad_vec
+            video_features = torch.from_numpy(feats).float()
+
         observation["video_features"] = video_features
 
         state_key = self.config.state_key
@@ -337,7 +380,7 @@ class SARMEncodingProcessorStep(ProcessorStep):
         batch_size = len(frame_indices)
         n_obs_steps = self.config.n_obs_steps
         max_rewind_steps = self.config.max_rewind_steps
-        total_frames = 1 + n_obs_steps + max_rewind_steps
+        total_frames = self.config.num_frames
         frame_gap = self.config.frame_gap
 
         global_names, temporal_props = self._get_annotation_config(annotation_type)

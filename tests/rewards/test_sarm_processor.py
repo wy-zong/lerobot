@@ -65,7 +65,14 @@ class MockConfig:
         annotation_mode: str = "dual",
         clip_batch_size: int = 64,
         text_dim: int = 512,
+        temporal_window_mode: str = "bidirectional",
+        precomputed_image_features_path: str | None = None,
     ):
+        self.temporal_window_mode = temporal_window_mode
+        if self.temporal_window_mode == "current_only":
+            n_obs_steps = 0
+            max_rewind_steps = 0
+
         self.n_obs_steps = n_obs_steps
         self.max_rewind_steps = max_rewind_steps
         self.frame_gap = frame_gap
@@ -83,17 +90,23 @@ class MockConfig:
         self.annotation_mode = annotation_mode
         self.clip_batch_size = clip_batch_size
         self.text_dim = text_dim
+        self.precomputed_image_features_path = precomputed_image_features_path
 
         # Compute observation delta indices (same as config: bidirectional)
-        half_steps = self.n_obs_steps // 2
-        past_deltas = [-self.frame_gap * i for i in range(half_steps, 0, -1)]
-        future_deltas = [self.frame_gap * i for i in range(1, half_steps + 1)]
-        obs_deltas = past_deltas + [0] + future_deltas
-        rewind_deltas = [-self.frame_gap * (i + 1) for i in range(self.max_rewind_steps)]
-        self.observation_delta_indices = obs_deltas + rewind_deltas
+        if self.temporal_window_mode == "current_only":
+            self.observation_delta_indices = [0]
+        else:
+            half_steps = self.n_obs_steps // 2
+            past_deltas = [-self.frame_gap * i for i in range(half_steps, 0, -1)]
+            future_deltas = [self.frame_gap * i for i in range(1, half_steps + 1)]
+            obs_deltas = past_deltas + [0] + future_deltas
+            rewind_deltas = [-self.frame_gap * (i + 1) for i in range(self.max_rewind_steps)]
+            self.observation_delta_indices = obs_deltas + rewind_deltas
 
     @property
     def num_frames(self) -> int:
+        if self.temporal_window_mode == "current_only":
+            return 1
         return 1 + self.n_obs_steps + self.max_rewind_steps
 
 
@@ -253,6 +266,124 @@ class TestSARMEncodingProcessorStepEndToEnd:
         dense_targets = obs["dense_targets"]
         assert dense_targets.shape == (batch_size, num_frames)
         assert (dense_targets >= 0).all()
+
+    def test_current_only_generates_single_frame_features_and_dense_targets(self, mock_clip_model):
+        """Test current_only mode encodes just the current frame and emits one target per sample."""
+        from lerobot.rewards.sarm.processor_sarm import SARMEncodingProcessorStep
+        from lerobot.rewards.sarm.sarm_utils import find_stage_and_tau
+
+        config = MockConfig(
+            temporal_window_mode="current_only",
+            rewind_probability=1.0,
+            language_perturbation_probability=0.0,
+            annotation_mode="dense_only",
+            dense_subtask_names=["fold", "place"],
+            dense_temporal_proportions=[0.5, 0.5],
+        )
+        dataset_meta = MockDatasetMeta(
+            [
+                {
+                    "dataset_from_index": 0,
+                    "dataset_to_index": 100,
+                    "task": "fold the rag",
+                    "dense_subtask_names": ["fold", "place"],
+                    "dense_subtask_start_frames": [0, 50],
+                    "dense_subtask_end_frames": [49, 99],
+                }
+            ]
+        )
+
+        processor = SARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta)
+        processor.train(True)
+
+        transition = {
+            TransitionKey.OBSERVATION: {
+                config.image_key: np.random.rand(1, 3, 224, 224).astype(np.float32),
+                config.state_key: np.random.rand(1, 6).astype(np.float32),
+            },
+            TransitionKey.COMPLEMENTARY_DATA: {
+                "index": 50,
+                "episode_index": 0,
+                "task": "fold the rag",
+            },
+        }
+
+        result = processor(transition)
+        obs = result[TransitionKey.OBSERVATION]
+
+        assert config.num_frames == 1
+        assert config.observation_delta_indices == [0]
+        assert obs["video_features"].shape == (1, 1, 512)
+        assert obs["state_features"].shape == (1, 1, config.max_state_dim)
+        assert obs["lengths"].tolist() == [1]
+        assert obs["sparse_targets"].shape == (1, 1)
+        assert obs["dense_targets"].shape == (1, 1)
+
+        expected_dense = find_stage_and_tau(
+            50,
+            100,
+            ["fold", "place"],
+            [0, 50],
+            [49, 99],
+            ["fold", "place"],
+            {"fold": 0.5, "place": 0.5},
+            return_combined=True,
+        )
+        assert obs["dense_targets"][0, 0].item() == pytest.approx(expected_dense)
+
+    def test_current_only_precomputed_features_lookup_uses_current_frame(
+        self, mock_clip_model, tmp_path
+    ):
+        """Test current_only mode looks up only the current frame from precomputed CLIP features."""
+        from lerobot.rewards.sarm.processor_sarm import SARMEncodingProcessorStep
+
+        features = np.zeros((100, 512), dtype=np.float32)
+        features[42] = np.arange(512, dtype=np.float32)
+        features_path = tmp_path / "clip_features.npy"
+        np.save(features_path, features)
+
+        config = MockConfig(
+            temporal_window_mode="current_only",
+            rewind_probability=1.0,
+            language_perturbation_probability=0.0,
+            annotation_mode="dense_only",
+            dense_subtask_names=["fold", "place"],
+            dense_temporal_proportions=[0.5, 0.5],
+            precomputed_image_features_path=str(features_path),
+        )
+        dataset_meta = MockDatasetMeta(
+            [
+                {
+                    "dataset_from_index": 0,
+                    "dataset_to_index": 100,
+                    "task": "fold the rag",
+                    "dense_subtask_names": ["fold", "place"],
+                    "dense_subtask_start_frames": [0, 50],
+                    "dense_subtask_end_frames": [49, 99],
+                }
+            ]
+        )
+
+        processor = SARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta)
+        processor.train(True)
+
+        transition = {
+            TransitionKey.OBSERVATION: {
+                config.state_key: np.random.rand(1, 6).astype(np.float32),
+            },
+            TransitionKey.COMPLEMENTARY_DATA: {
+                "index": 42,
+                "episode_index": 0,
+                "task": "fold the rag",
+            },
+        }
+
+        result = processor(transition)
+        obs = result[TransitionKey.OBSERVATION]
+
+        assert obs["video_features"].shape == (1, 1, 512)
+        np.testing.assert_allclose(obs["video_features"][0, 0].numpy(), features[42])
+        assert obs["dense_targets"].shape == (1, 1)
 
     def test_call_with_batched_input(self, mock_clip_model):
         """Test processor __call__ with a batched input (multiple frames) in dual mode."""

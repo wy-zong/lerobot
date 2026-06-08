@@ -18,12 +18,17 @@ SARM: Stage-Aware Reward Modeling for Long Horizon Robot Manipulation.
 Paper: https://arxiv.org/abs/2509.25358
 """
 
+import logging
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.configs.rewards import RewardModelConfig
 from lerobot.optim import AdamWConfig, CosineDecayWithWarmupSchedulerConfig
 from lerobot.utils.constants import OBS_IMAGES, OBS_STATE
+
+logger = logging.getLogger(__name__)
 
 
 @RewardModelConfig.register_subclass("sarm")
@@ -48,13 +53,14 @@ class SARMConfig(RewardModelConfig):
     """
 
     annotation_mode: str = "single_stage"  # "single_stage", "dense_only", or "dual"
+    temporal_window_mode: Literal["bidirectional", "current_only"] = "bidirectional"
     n_obs_steps: int = 8  # Number of observation history steps
     frame_gap: int = 30  # Frame gap between frames (at 30 fps = 1 second)
     max_rewind_steps: int = 4  # Maximum rewind steps for temporal augmentation
 
-    # Total frames = 1 + n_obs_steps + max_rewind_steps (computed in property)
-    # During training with rewind: [obs_frames] + [rewind_frames]
-    # During inference: [obs_frames] only
+    # In bidirectional mode, total frames = 1 + n_obs_steps + max_rewind_steps.
+    # During training with rewind: [obs_frames] + [rewind_frames].
+    # In current_only mode, the model sees only the current frame.
 
     # Architecture params
     image_dim: int = 512
@@ -86,6 +92,11 @@ class SARMConfig(RewardModelConfig):
     device: str | None = None
     image_key: str = OBS_IMAGES + ".top"  # Key for image used from the dataset
     state_key: str = OBS_STATE
+    # Optional path to a .npy memmap of CLIP image features, shape (N_total_frames, 512),
+    # indexed by absolute global frame index. When set, the per-step CLIP image encoder
+    # forward in SARMEncodingProcessorStep is replaced by a memmap lookup, and video
+    # decode is short-circuited. When None, the online CLIP path is preserved.
+    precomputed_image_features_path: str | None = None
 
     # Populated by the processor (video_features, state_features, text_features)
     input_features: dict = field(default_factory=lambda: {})
@@ -113,6 +124,15 @@ class SARMConfig(RewardModelConfig):
             raise ValueError(
                 f"annotation_mode must be 'single_stage', 'dense_only', or 'dual', got {self.annotation_mode}"
             )
+        if self.temporal_window_mode not in ["bidirectional", "current_only"]:
+            raise ValueError(
+                "temporal_window_mode must be 'bidirectional' or 'current_only', "
+                f"got {self.temporal_window_mode}"
+            )
+
+        if self.temporal_window_mode == "current_only":
+            self.n_obs_steps = 0
+            self.max_rewind_steps = 0
 
         if self.annotation_mode == "single_stage":
             # Use task description as stage name, full episode as one stage
@@ -162,7 +182,7 @@ class SARMConfig(RewardModelConfig):
                 shape=(self.num_frames, 1), type=FeatureType.REWARD
             )
 
-        if self.max_rewind_steps >= self.n_obs_steps:
+        if self.temporal_window_mode == "bidirectional" and self.max_rewind_steps >= self.n_obs_steps:
             raise ValueError(
                 f"max_rewind_steps ({self.max_rewind_steps}) must be less than n_obs_steps ({self.n_obs_steps})"
             )
@@ -174,6 +194,16 @@ class SARMConfig(RewardModelConfig):
             and self.num_dense_stages < 2
         ):
             raise ValueError(f"num_dense_stages must be at least 2, got {self.num_dense_stages}")
+
+        if (
+            self.precomputed_image_features_path is not None
+            and not Path(self.precomputed_image_features_path).is_file()
+        ):
+            logger.warning(
+                "precomputed_image_features_path=%s not found. "
+                "This is expected during inference/rollout. If you are training, this may cause an error.",
+                self.precomputed_image_features_path,
+            )
 
     def get_optimizer_preset(self) -> AdamWConfig:
         """Get default optimizer configuration for SARM training."""
@@ -205,9 +235,12 @@ class SARMConfig(RewardModelConfig):
     def num_frames(self) -> int:
         """Total number of frames in sequence.
 
-        For training: 1 + n_obs_steps + max_rewind_steps
-        The sequence is: [obs_frames (n_obs_steps + 1)] + [rewind_frames (max_rewind_steps)]
+        For bidirectional training: 1 + n_obs_steps + max_rewind_steps.
+        The sequence is: [obs_frames (n_obs_steps + 1)] + [rewind_frames (max_rewind_steps)].
+        For current_only: 1.
         """
+        if self.temporal_window_mode == "current_only":
+            return 1
         return 1 + self.n_obs_steps + self.max_rewind_steps
 
     @property
@@ -216,7 +249,7 @@ class SARMConfig(RewardModelConfig):
 
     @property
     def observation_delta_indices(self) -> list[int]:
-        """Bidirectional frame sampling centered on target frame.
+        """Frame sampling centered on target frame.
 
         Example with n_obs_steps=8, gap=30:
         Before: [-120, -90, -60, -30]  (4 frames)
@@ -224,6 +257,9 @@ class SARMConfig(RewardModelConfig):
         After:  [30, 60, 90, 120]      (4 frames)
         Total: 9 frames
         """
+        if self.temporal_window_mode == "current_only":
+            return [0]
+
         half_steps = self.n_obs_steps // 2
 
         past_deltas = [-self.frame_gap * i for i in range(half_steps, 0, -1)]

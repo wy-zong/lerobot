@@ -21,7 +21,6 @@ Paper: https://arxiv.org/abs/2509.25358
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
 
 from lerobot.configs import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.configs.rewards import RewardModelConfig
@@ -53,7 +52,7 @@ class SARMConfig(RewardModelConfig):
     """
 
     annotation_mode: str = "single_stage"  # "single_stage", "dense_only", or "dual"
-    temporal_window_mode: Literal["bidirectional", "current_only"] = "bidirectional"
+    temporal_window_mode: str = "bidirectional"  # "bidirectional" or "current_only"
     n_obs_steps: int = 8  # Number of observation history steps
     frame_gap: int = 30  # Frame gap between frames (at 30 fps = 1 second)
     max_rewind_steps: int = 4  # Maximum rewind steps for temporal augmentation

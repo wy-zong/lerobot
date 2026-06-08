@@ -62,7 +62,14 @@ import torch.nn.functional as F  # noqa: N812
 from safetensors.torch import load_file
 from torch import Tensor, nn
 
-from lerobot.utils.constants import ACTION, OBS_LANGUAGE_ATTENTION_MASK, OBS_LANGUAGE_TOKENS, OBS_STATE
+from lerobot.utils.constants import (
+    ACTION,
+    OBS_LANGUAGE_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+    OBS_LANGUAGE_SUBTASK_TOKENS,
+    OBS_LANGUAGE_TOKENS,
+    OBS_STATE,
+)
 from lerobot.utils.device_utils import get_safe_dtype
 from lerobot.utils.import_utils import require_package
 
@@ -387,8 +394,14 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _rtc_enabled(self) -> bool:
         return self.config.rtc_config is not None and self.config.rtc_config.enabled
 
-    def forward(
-        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
+    def _forward_action_flow(
+        self,
+        batch: dict[str, Tensor],
+        noise=None,
+        time=None,
+        reduction: str = "mean",
+        language_tokens_key: str = OBS_LANGUAGE_TOKENS,
+        language_attention_mask_key: str = OBS_LANGUAGE_ATTENTION_MASK,
     ) -> dict[str, Tensor]:
         """Do a full training forward pass to compute the loss.
 
@@ -419,8 +432,8 @@ class SmolVLAPolicy(PreTrainedPolicy):
             if drop_mask.any():
                 state = state.clone()
                 state[drop_mask] = 0
-        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
-        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        lang_tokens = batch[language_tokens_key]
+        lang_masks = batch[language_attention_mask_key]
         actions = self.prepare_action(batch)
         actions_is_pad = batch.get("action_is_pad")
         training_time_rtc_delay_steps = None
@@ -500,6 +513,70 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 loss = losses.sum() / num_valid
             loss_dict["loss"] = loss.item()
             return loss, loss_dict
+
+    def forward(
+        self, batch: dict[str, Tensor], noise=None, time=None, reduction: str = "mean"
+    ) -> dict[str, Tensor]:
+        """Do a full training forward pass to compute the standard action flow loss."""
+
+        return self._forward_action_flow(batch, noise=noise, time=time, reduction=reduction)
+
+    def forward_stage(
+        self,
+        batch: dict[str, Tensor],
+        noise=None,
+        time=None,
+        reduction: str = "mean",
+        flow_loss_weight: float = 10.0,
+    ) -> dict[str, Tensor]:
+        """Compute PI0.5-style stage loss using annotated subtasks.
+
+        The VLM predicts the annotated subtask from observation + high-level task, while the action expert
+        learns the flow-matching action loss conditioned on the annotated subtask tokens.
+        """
+
+        if reduction != "mean":
+            raise ValueError("forward_stage only supports reduction='mean'.")
+        if OBS_LANGUAGE_SUBTASK_TOKENS not in batch or OBS_LANGUAGE_SUBTASK_ATTENTION_MASK not in batch:
+            raise KeyError(
+                "SmolVLA forward_stage requires tokenized subtasks in the batch. "
+                f"Missing `{OBS_LANGUAGE_SUBTASK_TOKENS}` or `{OBS_LANGUAGE_SUBTASK_ATTENTION_MASK}`. "
+                "Use a dataset with subtask_index and meta/subtasks.parquet."
+            )
+
+        ce_batch = dict(batch)
+        if self.config.adapt_to_pi_aloha and self.config.use_state and OBS_STATE in ce_batch:
+            ce_batch[OBS_STATE] = self._pi_aloha_decode_state(ce_batch[OBS_STATE].clone())
+
+        images, img_masks = self.prepare_images(ce_batch)
+        state = self.prepare_state(ce_batch)
+        subtask_ce_loss = self.model.forward_subtask_prediction(
+            images=images,
+            img_masks=img_masks,
+            lang_tokens=batch[OBS_LANGUAGE_TOKENS],
+            lang_masks=batch[OBS_LANGUAGE_ATTENTION_MASK],
+            state=state,
+            subtask_tokens=batch[OBS_LANGUAGE_SUBTASK_TOKENS],
+            subtask_masks=batch[OBS_LANGUAGE_SUBTASK_ATTENTION_MASK],
+        )
+
+        action_flow_loss, output_dict = self._forward_action_flow(
+            batch,
+            noise=noise,
+            time=time,
+            reduction=reduction,
+            language_tokens_key=OBS_LANGUAGE_SUBTASK_TOKENS,
+            language_attention_mask_key=OBS_LANGUAGE_SUBTASK_ATTENTION_MASK,
+        )
+        loss = subtask_ce_loss + flow_loss_weight * action_flow_loss
+
+        if output_dict is None:
+            output_dict = {}
+        output_dict["subtask_ce_loss"] = subtask_ce_loss.item()
+        output_dict["action_flow_loss"] = action_flow_loss.item()
+        output_dict["flow_loss_weight"] = flow_loss_weight
+        output_dict["loss"] = loss.item()
+        return loss, output_dict
 
     def prepare_images(self, batch):
         """Apply SmolVLA preprocessing to the images, like resizing to 224x224 and padding to keep aspect ratio, and
@@ -594,7 +671,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         if self.config.use_state:
             projection_names.insert(0, "state_proj")
         common_projections = "|".join(projection_names)
-        target_modules = rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|model\.({common_projections}))"
+        target_modules = (
+            rf"(model\.vlm_with_expert\.lm_expert\..*\.(q|v)_proj|"
+            rf"model\.vlm_with_expert\.vlm\.model\.text_model\..*\.(q|v)_proj|"
+            rf"model\.({common_projections}))"
+        )
         return {
             "target_modules": target_modules,
             "modules_to_save": [],
@@ -964,6 +1045,78 @@ class VLAFlowMatching(nn.Module):
         v_t = self.action_out_proj(suffix_out)
         losses = F.mse_loss(u_t, v_t, reduction="none")
         return losses
+
+    def forward_subtask_prediction(
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: Tensor | None,
+        subtask_tokens,
+        subtask_masks,
+    ) -> Tensor:
+        """Teacher-force annotated subtask tokens from observation and high-level task."""
+
+        if subtask_tokens.ndim == 1:
+            subtask_tokens = subtask_tokens.unsqueeze(0)
+        if subtask_masks.ndim == 1:
+            subtask_masks = subtask_masks.unsqueeze(0)
+        subtask_tokens = subtask_tokens.to(device=lang_tokens.device, dtype=torch.long)
+        subtask_masks = subtask_masks.to(device=lang_tokens.device, dtype=torch.bool)
+
+        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+            images, img_masks, lang_tokens, lang_masks, state=state
+        )
+
+        subtask_embs = self.vlm_with_expert.embed_language_tokens(subtask_tokens)
+        subtask_emb_dim = subtask_embs.shape[-1]
+        subtask_embs = subtask_embs * math.sqrt(subtask_emb_dim)
+
+        inputs_embeds = torch.cat([prefix_embs, subtask_embs], dim=1)
+        pad_masks = torch.cat([prefix_pad_masks, subtask_masks], dim=1)
+        att_masks = torch.cat([prefix_att_masks, subtask_masks], dim=1)
+
+        att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+
+        (vlm_out, _), _ = self.vlm_with_expert.forward(
+            attention_mask=att_2d_masks,
+            position_ids=position_ids,
+            past_key_values=None,
+            inputs_embeds=[inputs_embeds, None],
+            use_cache=False,
+            fill_kv_cache=True,
+        )
+
+        lm_head = getattr(self.vlm_with_expert.vlm, "lm_head", None)
+        if lm_head is None:
+            raise AttributeError("SmolVLA VLM does not expose an lm_head for subtask prediction.")
+
+        lm_head_weight = getattr(lm_head, "weight", None)
+        if lm_head_weight is not None and vlm_out.dtype != lm_head_weight.dtype:
+            vlm_out = vlm_out.to(dtype=lm_head_weight.dtype)
+        logits = lm_head(vlm_out).to(dtype=torch.float32)
+
+        batch_size, subtask_length = subtask_tokens.shape
+        target_start = prefix_embs.shape[1]
+        prefix_valid_lengths = prefix_pad_masks.to(dtype=torch.long).sum(dim=1).clamp_min(1)
+        target_positions = (
+            torch.arange(subtask_length, device=subtask_tokens.device)[None, :].expand(batch_size, -1)
+            + target_start
+            - 1
+        )
+        target_positions[:, 0] = prefix_valid_lengths - 1
+        target_logits = logits.gather(
+            dim=1,
+            index=target_positions[:, :, None].expand(-1, -1, logits.shape[-1]),
+        )
+
+        valid_mask = subtask_masks
+        if not valid_mask.any():
+            raise ValueError("Cannot compute subtask_ce_loss because all subtask tokens are masked.")
+
+        return F.cross_entropy(target_logits[valid_mask], subtask_tokens[valid_mask], reduction="mean")
 
     def sample_actions(
         self,

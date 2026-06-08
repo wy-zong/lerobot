@@ -561,17 +561,29 @@ def test_features_basic():
     # Check that tokenized features are added
     assert f"{OBS_LANGUAGE}.tokens" in output_features[PipelineFeatureType.OBSERVATION]
     assert f"{OBS_LANGUAGE}.attention_mask" in output_features[PipelineFeatureType.OBSERVATION]
+    assert OBS_LANGUAGE_SUBTASK_TOKENS in output_features[PipelineFeatureType.OBSERVATION]
+    assert OBS_LANGUAGE_SUBTASK_ATTENTION_MASK in output_features[PipelineFeatureType.OBSERVATION]
 
     # Check feature properties
     tokens_feature = output_features[PipelineFeatureType.OBSERVATION][f"{OBS_LANGUAGE}.tokens"]
     attention_mask_feature = output_features[PipelineFeatureType.OBSERVATION][
         f"{OBS_LANGUAGE}.attention_mask"
     ]
+    subtask_tokens_feature = output_features[PipelineFeatureType.OBSERVATION][
+        OBS_LANGUAGE_SUBTASK_TOKENS
+    ]
+    subtask_attention_mask_feature = output_features[PipelineFeatureType.OBSERVATION][
+        OBS_LANGUAGE_SUBTASK_ATTENTION_MASK
+    ]
 
     assert tokens_feature.type == FeatureType.LANGUAGE
     assert tokens_feature.shape == (128,)
     assert attention_mask_feature.type == FeatureType.LANGUAGE
     assert attention_mask_feature.shape == (128,)
+    assert subtask_tokens_feature.type == FeatureType.LANGUAGE
+    assert subtask_tokens_feature.shape == (128,)
+    assert subtask_attention_mask_feature.type == FeatureType.LANGUAGE
+    assert subtask_attention_mask_feature.shape == (128,)
 
 
 @skip_if_package_missing("transformers")
@@ -586,14 +598,24 @@ def test_features_with_custom_max_length():
     # Check that features use correct max_length
     assert f"{OBS_LANGUAGE}.tokens" in output_features[PipelineFeatureType.OBSERVATION]
     assert f"{OBS_LANGUAGE}.attention_mask" in output_features[PipelineFeatureType.OBSERVATION]
+    assert OBS_LANGUAGE_SUBTASK_TOKENS in output_features[PipelineFeatureType.OBSERVATION]
+    assert OBS_LANGUAGE_SUBTASK_ATTENTION_MASK in output_features[PipelineFeatureType.OBSERVATION]
 
     tokens_feature = output_features[PipelineFeatureType.OBSERVATION][f"{OBS_LANGUAGE}.tokens"]
     attention_mask_feature = output_features[PipelineFeatureType.OBSERVATION][
         f"{OBS_LANGUAGE}.attention_mask"
     ]
+    subtask_tokens_feature = output_features[PipelineFeatureType.OBSERVATION][
+        OBS_LANGUAGE_SUBTASK_TOKENS
+    ]
+    subtask_attention_mask_feature = output_features[PipelineFeatureType.OBSERVATION][
+        OBS_LANGUAGE_SUBTASK_ATTENTION_MASK
+    ]
 
     assert tokens_feature.shape == (64,)
     assert attention_mask_feature.shape == (64,)
+    assert subtask_tokens_feature.shape == (64,)
+    assert subtask_attention_mask_feature.shape == (64,)
 
 
 @skip_if_package_missing("transformers")

@@ -21,6 +21,7 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 import dataclasses
 import logging
 import time
+from collections.abc import Callable
 from contextlib import nullcontext
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
@@ -161,7 +162,13 @@ def update_policy(
 
 
 @parser.wrap()
-def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
+def train(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator | None" = None,
+    update_policy_fn: Callable[..., tuple[MetricsTracker, dict | None]] = update_policy,
+    dataset_validator: Callable[[Any, TrainPipelineConfig], None] | None = None,
+    policy_setup_fn: Callable[[PreTrainedPolicy, TrainPipelineConfig], PreTrainedPolicy] | None = None,
+):
     """
     Main function to train a policy.
 
@@ -235,12 +242,16 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        if dataset_validator is not None:
+            dataset_validator(dataset, cfg)
 
     accelerator.wait_for_everyone()
 
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        if dataset_validator is not None:
+            dataset_validator(dataset, cfg)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -285,6 +296,9 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
             logging.info("Using PEFT! Wrapping model.")
             peft_cli_overrides = dataclasses.asdict(cfg.peft)
             policy = policy.wrap_with_peft(peft_cli_overrides=peft_cli_overrides)
+
+    if policy_setup_fn is not None:
+        policy = policy_setup_fn(policy, cfg)
 
     # Wait for all processes to finish model creation before continuing
     accelerator.wait_for_everyone()
@@ -463,7 +477,7 @@ def train(cfg: TrainPipelineConfig, accelerator: "Accelerator | None" = None):
         batch = preprocessor(batch)
         train_tracker.dataloading_s = time.perf_counter() - start_time
 
-        train_tracker, output_dict = update_policy(
+        train_tracker, output_dict = update_policy_fn(
             train_tracker,
             policy,
             batch,

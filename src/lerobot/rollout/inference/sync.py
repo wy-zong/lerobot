@@ -53,6 +53,7 @@ class SyncInferenceEngine(InferenceEngine):
         task: str,
         device: str | None,
         robot_type: str,
+        sarm_predictor: Any | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -60,6 +61,7 @@ class SyncInferenceEngine(InferenceEngine):
         self._dataset_features = dataset_features
         self._ordered_action_keys = ordered_action_keys
         self._task = task
+        self._sarm_predictor = sarm_predictor
         self._device = torch.device(device or "cpu")
         self._robot_type = robot_type
         self._relative_actions_enabled = any(
@@ -91,6 +93,8 @@ class SyncInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        if self._sarm_predictor is not None:
+            self._sarm_predictor.reset()
 
     def get_action(self, obs_frame: dict | None) -> torch.Tensor | None:
         """Run the full inference pipeline on ``obs_frame`` and return an action tensor."""
@@ -98,6 +102,10 @@ class SyncInferenceEngine(InferenceEngine):
             return self._action_queue.popleft()
         if obs_frame is None:
             return None
+
+        if self._sarm_predictor is not None:
+            self._task = self._sarm_predictor.predict_subtask(obs_frame, self._task)
+
         if self._relative_actions_enabled:
             return self._get_relative_action(obs_frame)
 

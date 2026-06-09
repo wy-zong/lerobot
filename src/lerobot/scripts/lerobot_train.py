@@ -468,9 +468,21 @@ def train(
             f"Start offline training on a fixed dataset, with effective batch size: {effective_batch_size}"
         )
 
+    has_warned_missing_subtask = False
     for _ in range(step, cfg.steps):
         start_time = time.perf_counter()
         batch = next(dl_iter)
+
+        if getattr(cfg, "use_subtasks", False):
+            if "subtask" in batch:
+                batch["task"] = batch["subtask"]
+            elif not has_warned_missing_subtask:
+                logging.warning(
+                    "cfg.use_subtasks is True, but 'subtask' key is missing from the dataset batch. "
+                    "Make sure your dataset provides subtask annotations. Falling back to default 'task' key."
+                )
+                has_warned_missing_subtask = True
+
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:
                 batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0

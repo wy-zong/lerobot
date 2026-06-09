@@ -105,6 +105,7 @@ class RTCInferenceEngine(InferenceEngine):
         compile_warmup_inferences: int = 2,
         rtc_queue_threshold: int = 30,
         shutdown_event: Event | None = None,
+        sarm_predictor: Any | None = None,
     ) -> None:
         self._policy = policy
         self._preprocessor = preprocessor
@@ -113,6 +114,7 @@ class RTCInferenceEngine(InferenceEngine):
         self._rtc_config = rtc_config
         self._hw_features = hw_features
         self._task = task
+        self._sarm_predictor = sarm_predictor
         self._fps = fps
         self._device = device or "cpu"
         self._use_torch_compile = use_torch_compile
@@ -222,6 +224,8 @@ class RTCInferenceEngine(InferenceEngine):
         self._policy.reset()
         self._preprocessor.reset()
         self._postprocessor.reset()
+        if self._sarm_predictor is not None:
+            self._sarm_predictor.reset()
         if self._action_queue is not None:
             self._action_queue.clear()
 
@@ -277,6 +281,10 @@ class RTCInferenceEngine(InferenceEngine):
                         delay = math.ceil(latency / time_per_chunk) if latency else 0
 
                         obs_batch = build_dataset_frame(self._hw_features, obs, prefix="observation")
+
+                        if self._sarm_predictor is not None:
+                            self._task = self._sarm_predictor.predict_subtask(obs_batch, self._task)
+
                         obs_batch = prepare_observation_for_inference(
                             obs_batch, policy_device, self._task, self._robot.robot_type
                         )
@@ -358,3 +366,5 @@ class RTCInferenceEngine(InferenceEngine):
             # Signal the top-level shutdown so strategies exit their control loops
             if self._global_shutdown_event is not None:
                 self._global_shutdown_event.set()
+
+

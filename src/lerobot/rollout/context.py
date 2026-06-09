@@ -117,6 +117,7 @@ class PolicyContext:
     preprocessor: PolicyProcessorPipeline
     postprocessor: PolicyProcessorPipeline
     inference: InferenceEngine
+    sarm_predictor: Any | None = None
 
 
 @dataclass
@@ -393,6 +394,41 @@ def build_rollout_context(
         },
     )
 
+    # --- 6.5. Optional: SARM subtask predictor ---
+    sarm_predictor = None
+    if getattr(cfg, "sarm_model_path", None):
+        from lerobot.configs.rewards import RewardModelConfig
+        from lerobot.rewards.factory import make_reward_model
+        from lerobot.rollout.sarm_predictor import SARMSubtaskPredictor
+
+        logger.info(f"Loading SARM model from {cfg.sarm_model_path} for subtask prediction...")
+        sarm_cfg = RewardModelConfig.from_pretrained(cfg.sarm_model_path)
+        sarm_model = make_reward_model(sarm_cfg)
+        sarm_model.eval()
+
+        # Hardcode CLIP model based on usual SARM config or fallback
+        clip_name = "openai/clip-vit-base-patch32"
+        logger.info(f"Loading CLIP Model ({clip_name}) for image features...")
+        from transformers import CLIPModel, CLIPProcessor
+
+        clip_processor = CLIPProcessor.from_pretrained(clip_name)
+        clip_model = CLIPModel.from_pretrained(clip_name).to(cfg.device)
+        clip_model.eval()
+
+        n_action_steps = getattr(policy.config, "n_action_steps", 1)
+        sarm_predictor = SARMSubtaskPredictor(
+            sarm_model=sarm_model,
+            clip_model=clip_model,
+            clip_processor=clip_processor,
+            device=cfg.device,
+            n_action_steps=n_action_steps,
+        )
+        logger.info(
+            "SARM subtask predictor created (n_action_steps=%d, head_mode=%s)",
+            n_action_steps,
+            sarm_predictor._head_mode,
+        )
+
     # --- 7. Inference strategy (needs policy + pre/post + hardware) --
     logger.info(
         "Creating inference engine (type=%s)...",
@@ -414,6 +450,7 @@ def build_rollout_context(
         use_torch_compile=cfg.use_torch_compile,
         compile_warmup_inferences=cfg.compile_warmup_inferences,
         shutdown_event=shutdown_event,
+        sarm_predictor=sarm_predictor,
     )
 
     # --- 8. Assemble ---------------------------------------------------
@@ -428,6 +465,7 @@ def build_rollout_context(
             preprocessor=preprocessor,
             postprocessor=postprocessor,
             inference=inference_strategy,
+            sarm_predictor=sarm_predictor,
         ),
         processors=ProcessorContext(
             teleop_action_processor=teleop_action_processor,

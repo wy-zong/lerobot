@@ -196,6 +196,9 @@ class RolloutConfig:
     # Inference backend (polymorphic: --inference.type=sync|rtc)
     inference: InferenceEngineConfig = field(default_factory=SyncInferenceConfig)
 
+    # SARM model path for subtask prediction during rollout
+    sarm_model_path: str | None = None
+
     # Dataset (required for sentry, highlight, dagger; None for base)
     dataset: DatasetRecordConfig | None = None
 

@@ -137,6 +137,11 @@ class SARMSubtaskPredictor:
                 images=img_pil, return_tensors="pt"
             ).to(self._device)
             video_emb = self._clip_model.get_image_features(**clip_inputs)  # [1, 512]
+            if not isinstance(video_emb, torch.Tensor):
+                video_emb = getattr(video_emb, "pooler_output", video_emb)
+            if not isinstance(video_emb, torch.Tensor):
+                # Fallback in case pooler_output is also not returning a tensor directly
+                video_emb = video_emb[0]
             video_emb = video_emb.unsqueeze(1)  # [1, 1, 512]
 
             text_emb = torch.zeros(

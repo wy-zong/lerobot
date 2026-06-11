@@ -84,6 +84,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
 from .configs import RobotClientConfig
 from .helpers import (
@@ -478,12 +479,22 @@ class RobotClient:
         return action
 
     def _record_policy_action(self, raw_observation: RawObservation, action: dict[str, Any]) -> None:
+        self._log_telemetry(raw_observation, action)
         if isinstance(self.config.strategy, SentryStrategyConfig):
             self.recorder.record_sentry_action(raw_observation, action)
         elif isinstance(self.config.strategy, HighlightStrategyConfig):
             self.recorder.record_highlight_action(raw_observation, action)
         elif self.dagger_controller is not None:
             self.dagger_controller.on_policy_action(raw_observation, action)
+
+    def _log_telemetry(self, observation: dict[str, Any] | None, action: dict[str, Any] | None) -> None:
+        if not self.config.display_data:
+            return
+        log_rerun_data(
+            observation=observation,
+            action=action,
+            compress_images=self.config.display_compressed_images,
+        )
 
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
@@ -638,6 +649,12 @@ class RobotClient:
 def async_client(cfg: RobotClientConfig):
     logging.info(pformat(asdict(cfg)))
 
+    if cfg.display_data:
+        logging.info("Initializing Rerun visualization (ip=%s, port=%s)", cfg.display_ip, cfg.display_port)
+        init_rerun(session_name="async_inference", ip=cfg.display_ip, port=cfg.display_port)
+        if cfg.display_ip is not None and cfg.display_port is not None:
+            cfg.display_compressed_images = True
+
     # TODO: Assert if checking robot support is still needed with the plugin system
     # if cfg.robot.type not in SUPPORTED_ROBOTS:
     #     raise ValueError(f"Robot {cfg.robot.type} not yet supported!")
@@ -665,6 +682,8 @@ def async_client(cfg: RobotClientConfig):
             action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:
                 visualize_action_queue_size(client.action_queue_size)
+            if cfg.display_data:
+                shutdown_rerun()
             client.logger.info("Client stopped")
 
 

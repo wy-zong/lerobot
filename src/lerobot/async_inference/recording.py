@@ -54,6 +54,7 @@ from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dic
 from lerobot.utils.pedal import start_pedal_listener
 from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.utils import log_say
+from lerobot.utils.visualization_utils import log_rerun_data
 
 if TYPE_CHECKING:
     from lerobot.async_inference.configs import RobotClientConfig
@@ -539,6 +540,7 @@ class RemoteDAggerController:
         performed_action = self.robot.send_action(teleop_action)
         action_for_recording = performed_action or teleop_action
         self.last_action = action_for_recording
+        self._log_telemetry(observation, action_for_recording)
         self.recorder.add_frame(observation, action_for_recording, intervention=True)
         return observation, action_for_recording
 
@@ -546,6 +548,15 @@ class RemoteDAggerController:
         self.last_action = action
         if self.strategy.record_autonomous:
             self.recorder.add_frame(observation, action, intervention=False)
+
+    def _log_telemetry(self, observation: dict[str, Any] | None, action: dict[str, Any] | None) -> None:
+        if not self.cfg.display_data:
+            return
+        log_rerun_data(
+            observation=observation,
+            action=action,
+            compress_images=self.cfg.display_compressed_images,
+        )
 
     def _handle_correction_finished(self) -> None:
         if self.strategy.record_autonomous:

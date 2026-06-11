@@ -175,6 +175,12 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Rerun visualization on the execution host.
+    display_data: bool = False
+    display_ip: str | None = None
+    display_port: int | None = None
+    display_compressed_images: bool = False
+
     # Rollout-style local recording on the execution host. The policy server/proto is unchanged.
     strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
     dataset: DatasetRecordConfig | None = None
@@ -288,6 +294,10 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "display_data": self.display_data,
+            "display_ip": self.display_ip,
+            "display_port": self.display_port,
+            "display_compressed_images": self.display_compressed_images,
             "strategy": self.strategy.type,
             "duration": self.duration,
             "resume": self.resume,

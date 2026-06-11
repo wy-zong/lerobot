@@ -423,6 +423,31 @@ def test_remote_dagger_corrections_only_records_interventions(monkeypatch):
     robot.disconnect()
 
 
+def test_robot_client_display_data_logs_policy_actions(monkeypatch, robot_client):
+    import lerobot.async_inference.robot_client as robot_client_module
+
+    logged = []
+
+    def fake_log_rerun_data(**kwargs):
+        logged.append(kwargs)
+
+    monkeypatch.setattr(robot_client_module, "log_rerun_data", fake_log_rerun_data)
+    robot_client.config.display_data = True
+    robot_client.config.display_compressed_images = True
+
+    observation = {"motor_1.pos": 1.0}
+    action = {"motor_1.pos": 2.0}
+    robot_client._record_policy_action(observation, action)
+
+    assert logged == [
+        {
+            "observation": observation,
+            "action": action,
+            "compress_images": True,
+        }
+    ]
+
+
 def test_keyboard_stop_listener_sets_shutdown_on_escape(monkeypatch):
     import lerobot.async_inference.robot_client as robot_client_module
 

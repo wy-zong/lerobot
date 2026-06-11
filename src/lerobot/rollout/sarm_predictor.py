@@ -16,11 +16,14 @@
 
 from __future__ import annotations
 
+import datetime
 import logging
+import os
 from typing import Any
 
 import torch
 import torchvision.transforms.functional as F
+from PIL import ImageDraw
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +68,14 @@ class SARMSubtaskPredictor:
             # single_stage or any sparse-like mode
             self._subtask_names = list(cfg.sparse_subtask_names or [])
             self._head_mode = "sparse"
+
+        # Create output directory for SARM predictions
+        self.output_dir = os.path.join(
+            r"C:\Users\ccu\mujoco_ur5_graph\outputs",
+            "sarm_predictions_" + datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        )
+        os.makedirs(self.output_dir, exist_ok=True)
+        self.img_counter = 0
 
     def reset(self) -> None:
         """Reset the step counter and cached subtask (call on episode boundary)."""
@@ -156,17 +167,38 @@ class SARMSubtaskPredictor:
                 head_mode=self._head_mode,
             )
 
+            predicted_task = current_task
+
             if len(outputs) >= 2:
                 stage_probs = outputs[1]
                 stage_idx = stage_probs[0, 0].argmax(-1).item()
                 if stage_idx < len(self._subtask_names):
                     new_subtask = self._subtask_names[stage_idx]
+                    predicted_task = new_subtask
                     if current_task != new_subtask:
                         logger.info(
                             "SARM switched subtask: '%s' -> '%s'",
                             current_task,
                             new_subtask,
                         )
-                    return new_subtask
+                        
+            # Save the image with prediction overlay
+            try:
+                img_to_save = img_pil.copy()
+                img_to_save.thumbnail((320, 240))  # Downscale to save space
+                draw = ImageDraw.Draw(img_to_save)
+                
+                # Draw text with a simple shadow for better visibility
+                text = f"Pred: {predicted_task}"
+                draw.text((11, 11), text, fill=(0, 0, 0))
+                draw.text((10, 10), text, fill=(255, 0, 0))
+                
+                save_path = os.path.join(self.output_dir, f"frame_{self.img_counter:04d}.jpg")
+                img_to_save.save(save_path)
+                self.img_counter += 1
+            except Exception as e:
+                logger.warning(f"Failed to save SARM prediction image: {e}")
+
+            return predicted_task
 
         return current_task

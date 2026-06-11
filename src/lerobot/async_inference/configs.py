@@ -33,6 +33,8 @@ AGGREGATE_FUNCTIONS = {
     "conservative": lambda old, new: 0.7 * old + 0.3 * new,
 }
 
+INFERENCE_MODES = {"async", "sync"}
+
 
 def get_aggregate_function(name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Get aggregate function by name from registry."""
@@ -140,6 +142,10 @@ class RobotClientConfig:
     )
 
     # Control behavior configuration
+    inference_mode: str = field(
+        default="async",
+        metadata={"help": "Inference scheduling mode. Options: 'async' or 'sync'."},
+    )
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
 
@@ -176,6 +182,9 @@ class RobotClientConfig:
         if not self.client_device:
             raise ValueError("client_device cannot be empty")
 
+        if self.inference_mode not in INFERENCE_MODES:
+            raise ValueError(f"inference_mode must be one of {sorted(INFERENCE_MODES)}, got {self.inference_mode}")
+
         if self.chunk_size_threshold < 0 or self.chunk_size_threshold > 1:
             raise ValueError(f"chunk_size_threshold must be between 0 and 1, got {self.chunk_size_threshold}")
 
@@ -200,6 +209,7 @@ class RobotClientConfig:
             "pretrained_name_or_path": self.pretrained_name_or_path,
             "policy_device": self.policy_device,
             "client_device": self.client_device,
+            "inference_mode": self.inference_mode,
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,

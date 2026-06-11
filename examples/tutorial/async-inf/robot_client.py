@@ -33,6 +33,7 @@ def main():
         client_device="cpu",
         policy_type="act",
         pretrained_name_or_path="<user>/robot_learning_tutorial_act",
+        inference_mode="async",
         chunk_size_threshold=0.5,  # g
         actions_per_chunk=50,  # make sure this is less than the max actions of the policy
     )

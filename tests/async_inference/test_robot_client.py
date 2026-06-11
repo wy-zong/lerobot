@@ -19,6 +19,8 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import pickle  # nosec
+import threading
 import time
 from queue import Queue
 
@@ -89,6 +91,38 @@ def _make_actions(start_ts: float, start_t: int, count: int):
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("inference_mode", ["async", "sync"])
+def test_robot_client_config_accepts_supported_inference_modes(inference_mode: str):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        inference_mode=inference_mode,
+    )
+
+    assert config.inference_mode == inference_mode
+
+
+def test_robot_client_config_rejects_unknown_inference_mode():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="inference_mode"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            inference_mode="streaming",
+        )
 
 
 def test_update_action_queue_discards_stale(robot_client):
@@ -233,6 +267,115 @@ def test_ready_to_send_observation_with_varying_threshold(robot_client, g_thresh
         robot_client.action_queue.put(act)
 
     assert robot_client._ready_to_send_observation() is expected
+
+
+def test_ready_to_send_observation_sync_requires_empty_queue_and_no_pending_chunk(robot_client):
+    robot_client.inference_mode = "sync"
+    robot_client.must_go.set()
+    robot_client.awaiting_action_chunk.clear()
+
+    robot_client.action_queue = Queue()
+    robot_client.action_queue.put(_make_actions(start_ts=time.time(), start_t=0, count=1)[0])
+    assert robot_client._ready_to_send_observation() is False
+
+    robot_client.action_queue = Queue()
+    assert robot_client._ready_to_send_observation() is True
+
+    robot_client.awaiting_action_chunk.set()
+    assert robot_client._ready_to_send_observation() is False
+
+    robot_client.awaiting_action_chunk.clear()
+    robot_client.must_go.clear()
+    assert robot_client._ready_to_send_observation() is False
+
+
+def test_sync_control_loop_observation_marks_pending_after_must_go_send(monkeypatch, robot_client):
+    robot_client.inference_mode = "sync"
+    robot_client.action_queue = Queue()
+    robot_client.must_go.set()
+    robot_client.awaiting_action_chunk.clear()
+
+    sent_observations = []
+
+    def fake_send_observation(observation):
+        sent_observations.append(observation)
+        return True
+
+    monkeypatch.setattr(robot_client, "send_observation", fake_send_observation)
+
+    robot_client.control_loop_observation(task="test task")
+
+    assert len(sent_observations) == 1
+    assert sent_observations[0].must_go is True
+    assert robot_client.awaiting_action_chunk.is_set() is True
+    assert robot_client.must_go.is_set() is False
+
+
+def test_receive_actions_clears_sync_pending_chunk(monkeypatch, robot_client):
+    from lerobot.transport import services_pb2
+
+    robot_client.inference_mode = "sync"
+    robot_client.awaiting_action_chunk.set()
+
+    actions = _make_actions(start_ts=time.time(), start_t=0, count=2)
+
+    class FakeStub:
+        def GetActions(self, request):  # noqa: N802
+            return services_pb2.Actions(data=pickle.dumps(actions))
+
+    robot_client.stub = FakeStub()
+    original_aggregate = robot_client._aggregate_action_queues
+
+    def aggregate_and_stop(incoming_actions, aggregate_fn=None):
+        try:
+            return original_aggregate(incoming_actions, aggregate_fn)
+        finally:
+            robot_client.shutdown_event.set()
+
+    monkeypatch.setattr(robot_client, "_aggregate_action_queues", aggregate_and_stop)
+
+    action_thread = threading.Thread(target=robot_client.receive_actions)
+    action_thread.start()
+    robot_client.start_barrier.wait(timeout=1)
+    action_thread.join(timeout=1)
+
+    assert action_thread.is_alive() is False
+    assert robot_client.awaiting_action_chunk.is_set() is False
+    assert robot_client.action_queue.qsize() == 2
+
+
+def test_sync_mode_waits_for_chunk_exhaustion_before_next_observation(monkeypatch, robot_client):
+    robot_client.inference_mode = "sync"
+    robot_client.action_queue = Queue()
+    robot_client.latest_action = -1
+    robot_client.must_go.set()
+    robot_client.awaiting_action_chunk.clear()
+
+    sent_observations = []
+
+    def fake_send_observation(observation):
+        sent_observations.append(observation)
+        return True
+
+    monkeypatch.setattr(robot_client, "send_observation", fake_send_observation)
+
+    assert robot_client._ready_to_send_observation() is True
+    robot_client.control_loop_observation(task="test task")
+    assert len(sent_observations) == 1
+    assert robot_client.awaiting_action_chunk.is_set() is True
+
+    robot_client._aggregate_action_queues(_make_actions(start_ts=time.time(), start_t=0, count=3))
+    robot_client.awaiting_action_chunk.clear()
+    robot_client.must_go.set()
+
+    assert robot_client._ready_to_send_observation() is False
+    robot_client.control_loop_action()
+    assert robot_client._ready_to_send_observation() is False
+    robot_client.control_loop_action()
+    assert robot_client._ready_to_send_observation() is False
+
+    robot_client.control_loop_action()
+    assert robot_client._ready_to_send_observation() is True
 
 
 # -----------------------------------------------------------------------------

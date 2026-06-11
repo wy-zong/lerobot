@@ -8,7 +8,7 @@ In this tutorial, we'll show how to use asynchronous inference (_async inference
 
 1. Why asynchronous inference matters and how it compares to, more traditional, sequential inference.
 2. How to spin-up a `PolicyServer` and connect a `RobotClient` from the same machine, and even over the network.
-3. How to tune key parameters (`actions_per_chunk`, `chunk_size_threshold`) for your robot and policy.
+3. How to tune key parameters (`actions_per_chunk`, `inference_mode`, `chunk_size_threshold`) for your robot and policy.
 
 If you get stuck, hop into our [Discord community](https://discord.gg/s3KuuzsPFb)!
 
@@ -50,6 +50,7 @@ python -m lerobot.async_inference.robot_client \
     --pretrained_name_or_path=user/model \ # POLICY: the model name/path on server to the checkpoint to run (e.g., lerobot/smolvla_base)
     --policy_device=mps \ # POLICY: the device to run the policy on, on the server (cuda, mps, xpu, cpu)
     --actions_per_chunk=50 \ # POLICY: the number of actions to output at once
+    --inference_mode=async \ # CLIENT: async overlaps action chunks; sync waits for the current chunk to finish
     --chunk_size_threshold=0.5 \ # CLIENT: the threshold for the chunk size before sending a new observation to the server
     --aggregate_fn_name=weighted_average \ # CLIENT: the function to aggregate actions on overlapping portions
     --debug_visualize_queue_size=True # CLIENT: whether to visualize the queue size at runtime
@@ -64,7 +65,7 @@ In summary, you need to specify instructions for:
 
 Importantly,
 
-- `actions_per_chunk` and `chunk_size_threshold` are key parameters to tune for your setup.
+- `actions_per_chunk`, `inference_mode`, and `chunk_size_threshold` are key parameters to tune for your setup.
 - `aggregate_fn_name` is the function to aggregate actions on overlapping portions. You can either add a new one to a registry of functions, or add your own in `robot_client.py` (see [here](NOTE:addlinktoLOC))
 - `debug_visualize_queue_size` is a useful tool to tune the `CLIENT` parameters.
 
@@ -159,6 +160,7 @@ python -m lerobot.async_inference.robot_client \
     --pretrained_name_or_path=user/model \ # POLICY: the model name/path on server to the checkpoint to run (e.g., lerobot/smolvla_base)
     --policy_device=mps \ # POLICY: the device to run the policy on, on the server
     --actions_per_chunk=50 \ # POLICY: the number of actions to output at once
+    --inference_mode=async \ # CLIENT: async overlaps action chunks; sync waits for the current chunk to finish
     --chunk_size_threshold=0.5 \ # CLIENT: the threshold for the chunk size before sending a new observation to the server
     --aggregate_fn_name=weighted_average \ # CLIENT: the function to aggregate actions on overlapping portions
     --debug_visualize_queue_size=True # CLIENT: whether to visualize the queue size at runtime
@@ -198,6 +200,7 @@ client_cfg = RobotClientConfig(
     client_device="cpu",
     policy_type="smolvla",
     pretrained_name_or_path="<user>/smolvla_async",
+    inference_mode="async",
     chunk_size_threshold=0.5,
     actions_per_chunk=50,  # make sure this is less than the max actions of the policy
 )
@@ -227,7 +230,7 @@ if client.start():
 </hfoption>
 </hfoptions>
 
-The following two parameters are key in every setup:
+The following three parameters are key in every setup:
 
 <table>
   <thead>
@@ -249,9 +252,20 @@ The following two parameters are key in every setup:
     </tr>
     <tr>
       <td>
+        <code>inference_mode</code>
+      </td>
+      <td>async</td>
+      <td>
+        <code>async</code> requests the next chunk before the current queue is empty.
+        <code>sync</code> waits until the current chunk is fully executed before
+        sending the next must-go observation.
+      </td>
+    </tr>
+    <tr>
+      <td>
         <code>chunk_size_threshold</code>
       </td>
-      <td>0.7</td>
+      <td>0.5</td>
       <td>
         When the queue is ≤ 50% full, the client sends a fresh observation.
         Value in [0, 1].
@@ -269,7 +283,9 @@ On the one hand, increasing the value of `actions_per_chunk` will result in redu
 However, larger values of `actions_per_chunk` might also result in less precise actions, due to the compounding errors consequent to predicting actions over longer timespans.
 
 On the other hand, increasing the value of `chunk_size_threshold` will result in sending out to the `PolicyServer` observations for inference more often, resulting in a larger number of updates action chunks, overlapping on significant portions. This results in high adaptability, in the limit predicting one action chunk for each observation, which is in turn only marginally consumed while a new one is produced.
-This option does also put more pressure on the inference pipeline, as a consequence of the many requests. Conversely, values of `chunk_size_threshold` close to 0.0 collapse to the synchronous edge case, whereby new observations are only sent out whenever the current chunk is exhausted.
+This option does also put more pressure on the inference pipeline, as a consequence of the many requests. Conversely, values of `chunk_size_threshold` close to 0.0 make async mode more sequential, but the client may still have an in-flight remote inference request.
+
+Use `inference_mode="sync"` when you want strict chunk-by-chunk behavior over two hosts: the robot client sends a must-go observation only after its local action queue is empty, waits for the remote `PolicyServer` to return the next chunk, and sends no new action while it is waiting. This is useful when you want inference to run on a faster remote GPU while avoiding overlap and action aggregation effects. The idle time is roughly the network round trip plus server inference time; for SmolVLA on a 4090-class GPU this is often around 0.1-0.2 seconds.
 
 We found the default values of `actions_per_chunk` and `chunk_size_threshold` to work well in the experiments we developed for the [SmolVLA paper](https://huggingface.co/papers/2506.01844), but recommend experimenting with different values to find the best fit for your setup.
 
@@ -277,7 +293,10 @@ We found the default values of `actions_per_chunk` and `chunk_size_threshold` to
 
 1. **Choose your computational resources carefully.** [PI0](https://huggingface.co/lerobot/pi0) occupies 14GB of memory at inference time, while [SmolVLA](https://huggingface.co/lerobot/smolvla_base) requires only ~2GB. You should identify the best computational resource for your use case keeping in mind smaller policies require less computational resources. The combination of policy and device used (CPU-intensive, using MPS, or the number of CUDA cores on a given NVIDIA GPU) directly impacts the average inference latency you should expect.
 2. **Adjust your `fps` based on inference latency.** While the server generates a new action chunk, the client is not idle and is stepping through its current action queue. If the two processes happen at fundamentally different speeds, the client might end up with an empty queue. As such, you should reduce your fps if you consistently run out of actions in queue.
-3. **Adjust `chunk_size_threshold`**.
+3. **Choose `inference_mode`**.
+   - Use `async` to keep the robot moving while the server predicts the next chunk. This is the default and uses `aggregate_fn_name` to merge overlapping action chunks.
+   - Use `sync` to wait for each chunk to finish before requesting the next one. In this mode, `chunk_size_threshold` and action aggregation do not provide overlap benefits.
+4. **Adjust `chunk_size_threshold`**.
    - Values closer to `0.0` result in almost sequential behavior. Values closer to `1.0` → send observation every step (more bandwidth, relies on good world-model).
    - We found values around 0.5-0.6 to work well. If you want to tweak this, spin up a `RobotClient` setting the `--debug_visualize_queue_size` to `True`. This will plot the action queue size evolution at runtime, and you can use it to find the value of `chunk_size_threshold` that works best for your setup.
 
@@ -306,7 +325,7 @@ Asynchronous inference represents a significant advancement in real-time robotic
 - **Paradigm Shift**: Async inference decouples action prediction from execution, allowing robots to continue acting while new action chunks are computed in parallel
 - **Performance Benefits**: Eliminates "wait-for-inference" lags that are inherent in synchronous approaches, becoming increasingly important as policy models grow larger
 - **Flexible Architecture**: The server-client design enables distributed computing, where inference can run on powerful remote hardware while maintaining real-time robot control
-- **Tunable Parameters**: Success depends on properly configuring `actions_per_chunk` and `chunk_size_threshold` for your specific hardware, policy, and task requirements
+- **Tunable Parameters**: Success depends on properly configuring `actions_per_chunk`, `inference_mode`, and `chunk_size_threshold` for your specific hardware, policy, and task requirements
 - **Universal Compatibility**: Works with all LeRobot-supported policies, from lightweight ACT models to vision-language models like SmolVLA
 
 Start experimenting with the default parameters, monitor your action queue sizes, and iteratively refine your setup to achieve optimal performance for your specific use case.

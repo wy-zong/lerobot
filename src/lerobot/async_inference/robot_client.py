@@ -27,6 +27,7 @@ python src/lerobot/async_inference/robot_client.py \
     --policy_device=mps \
     --client_device=cpu \
     --actions_per_chunk=50 \
+    --inference_mode=async \
     --chunk_size_threshold=0.5 \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
@@ -120,6 +121,7 @@ class RobotClient:
         self.latest_action = -1
         self.action_chunk_size = -1
 
+        self.inference_mode = config.inference_mode
         self._chunk_size_threshold = config.chunk_size_threshold
 
         self.action_queue = Queue()
@@ -135,6 +137,7 @@ class RobotClient:
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
+        self.awaiting_action_chunk = threading.Event()
 
     @property
     def running(self):
@@ -334,6 +337,7 @@ class RobotClient:
                 self._aggregate_action_queues(timed_actions, self.config.aggregate_fn)
                 queue_update_time = time.perf_counter() - start_time
 
+                self.awaiting_action_chunk.clear()
                 self.must_go.set()  # after receiving actions, next empty queue triggers must-go processing!
 
                 if verbose:
@@ -403,6 +407,13 @@ class RobotClient:
     def _ready_to_send_observation(self):
         """Flags when the client is ready to send an observation"""
         with self.action_queue_lock:
+            if self.inference_mode == "sync":
+                return (
+                    self.action_queue.empty()
+                    and self.must_go.is_set()
+                    and not self.awaiting_action_chunk.is_set()
+                )
+
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
     def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
@@ -429,12 +440,17 @@ class RobotClient:
                 observation.must_go = self.must_go.is_set() and self.action_queue.empty()
                 current_queue_size = self.action_queue.qsize()
 
-            _ = self.send_observation(observation)
+            sent = self.send_observation(observation)
 
             self.logger.debug(f"QUEUE SIZE: {current_queue_size} (Must go: {observation.must_go})")
             if observation.must_go:
-                # must-go event will be set again after receiving actions
-                self.must_go.clear()
+                if sent:
+                    if self.inference_mode == "sync":
+                        self.awaiting_action_chunk.set()
+                    # must-go event will be set again after receiving actions
+                    self.must_go.clear()
+                elif self.inference_mode != "sync":
+                    self.must_go.clear()
 
             if verbose:
                 # Calculate comprehensive FPS metrics

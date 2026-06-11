@@ -20,9 +20,11 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 from __future__ import annotations
 
 import pickle  # nosec
+import sys
 import threading
 import time
 from queue import Queue
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -88,6 +90,47 @@ def _make_actions(start_ts: float, start_t: int, count: int):
     return actions
 
 
+class _FakeLogger:
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+
+    def info(self, message):
+        self.infos.append(message)
+
+    def warning(self, message):
+        self.warnings.append(message)
+
+
+def _make_keyboard_stop_client():
+    return SimpleNamespace(logger=_FakeLogger(), shutdown_event=threading.Event())
+
+
+def _make_fake_pynput_module():
+    esc_key = object()
+
+    class FakeListener:
+        instances = []
+
+        def __init__(self, on_press):
+            self.on_press = on_press
+            self.started = False
+            self.stopped = False
+            self.instances.append(self)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    fake_keyboard = SimpleNamespace(Key=SimpleNamespace(esc=esc_key), Listener=FakeListener)
+    fake_pynput = ModuleType("pynput")
+    fake_pynput.keyboard = fake_keyboard
+
+    return fake_pynput, fake_keyboard, FakeListener
+
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
@@ -123,6 +166,69 @@ def test_robot_client_config_rejects_unknown_inference_mode():
             actions_per_chunk=20,
             inference_mode="streaming",
         )
+
+
+def test_keyboard_stop_listener_sets_shutdown_on_escape(monkeypatch):
+    import lerobot.async_inference.robot_client as robot_client_module
+
+    client = _make_keyboard_stop_client()
+    fake_pynput, fake_keyboard, fake_listener_cls = _make_fake_pynput_module()
+    monkeypatch.setattr(robot_client_module.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput)
+
+    listener = robot_client_module._start_keyboard_stop_listener(client)
+
+    assert listener is fake_listener_cls.instances[0]
+    assert listener.started is True
+    assert listener.on_press(fake_keyboard.Key.esc) is False
+    assert client.shutdown_event.is_set() is True
+
+
+def test_keyboard_stop_listener_ignores_non_escape(monkeypatch):
+    import lerobot.async_inference.robot_client as robot_client_module
+
+    client = _make_keyboard_stop_client()
+    fake_pynput, _fake_keyboard, fake_listener_cls = _make_fake_pynput_module()
+    monkeypatch.setattr(robot_client_module.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput)
+
+    listener = robot_client_module._start_keyboard_stop_listener(client)
+
+    assert listener is fake_listener_cls.instances[0]
+    assert listener.on_press(object()) is None
+    assert client.shutdown_event.is_set() is False
+
+
+def test_keyboard_stop_listener_returns_none_in_headless_linux(monkeypatch):
+    import lerobot.async_inference.robot_client as robot_client_module
+
+    client = _make_keyboard_stop_client()
+    monkeypatch.setattr(robot_client_module.sys, "platform", "linux")
+    monkeypatch.delenv("DISPLAY", raising=False)
+
+    listener = robot_client_module._start_keyboard_stop_listener(client)
+
+    assert listener is None
+    assert client.shutdown_event.is_set() is False
+    assert client.logger.warnings == [
+        "Headless environment detected. ESC keyboard shutdown is unavailable."
+    ]
+
+
+def test_keyboard_stop_listener_returns_none_without_pynput(monkeypatch):
+    import lerobot.async_inference.robot_client as robot_client_module
+
+    client = _make_keyboard_stop_client()
+    fake_pynput = ModuleType("pynput")
+    monkeypatch.setattr(robot_client_module.sys, "platform", "win32")
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput)
+    monkeypatch.delitem(sys.modules, "pynput.keyboard", raising=False)
+
+    listener = robot_client_module._start_keyboard_stop_listener(client)
+
+    assert listener is None
+    assert client.shutdown_event.is_set() is False
+    assert client.logger.warnings[0].startswith("Could not start ESC keyboard listener:")
 
 
 def test_update_action_queue_discards_stale(robot_client):

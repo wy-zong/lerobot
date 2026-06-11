@@ -35,7 +35,9 @@ python src/lerobot/async_inference/robot_client.py \
 """
 
 import logging
+import os
 import pickle  # nosec
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -79,6 +81,32 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+
+
+def _start_keyboard_stop_listener(client: "RobotClient"):
+    """Start an optional ESC listener that requests a clean client shutdown."""
+    if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
+        client.logger.warning("Headless environment detected. ESC keyboard shutdown is unavailable.")
+        return None
+
+    try:
+        from pynput import keyboard
+    except Exception as e:
+        client.logger.warning(f"Could not start ESC keyboard listener: {e}")
+        return None
+
+    def on_press(key):
+        if key == keyboard.Key.esc:
+            client.logger.info("ESC pressed, stopping client")
+            client.shutdown_event.set()
+            return False
+
+        return None
+
+    listener = keyboard.Listener(on_press=on_press)
+    listener.start()
+    client.logger.info("ESC keyboard listener started")
+    return listener
 
 
 class RobotClient:
@@ -509,6 +537,7 @@ def async_client(cfg: RobotClientConfig):
 
     if client.start():
         client.logger.info("Starting action receiver thread...")
+        keyboard_listener = _start_keyboard_stop_listener(client)
 
         # Create and start action receiver thread
         action_receiver_thread = threading.Thread(target=client.receive_actions, daemon=True)
@@ -521,6 +550,8 @@ def async_client(cfg: RobotClientConfig):
             client.control_loop(task=cfg.task)
 
         finally:
+            if keyboard_listener is not None:
+                keyboard_listener.stop()
             client.stop()
             action_receiver_thread.join()
             if cfg.debug_visualize_queue_size:

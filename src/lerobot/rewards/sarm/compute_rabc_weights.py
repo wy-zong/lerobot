@@ -59,9 +59,9 @@ from tqdm import tqdm
 
 from lerobot.datasets import LeRobotDataset
 
-from .modeling_sarm import SARMRewardModel
-from .processor_sarm import make_sarm_pre_post_processors
-from .sarm_utils import normalize_stage_tau
+from lerobot.rewards.sarm.modeling_sarm import SARMRewardModel
+from lerobot.rewards.sarm.processor_sarm import make_sarm_pre_post_processors
+from lerobot.rewards.sarm.sarm_utils import normalize_stage_tau
 
 
 def get_reward_model_path_from_parquet(parquet_path: Path) -> str | None:
@@ -81,6 +81,7 @@ def load_sarm_resources(
     dataset_repo_id: str,
     reward_model_path: str,
     device: str = "cuda",
+    image_key_override: str | None = None,
 ) -> tuple[LeRobotDataset, SARMRewardModel, any]:
     """
     Load SARM model, dataset, and preprocessor.
@@ -92,6 +93,10 @@ def load_sarm_resources(
     reward_model = SARMRewardModel.from_pretrained(reward_model_path)
     reward_model.config.device = device
     reward_model.to(device).eval()
+
+    if image_key_override:
+        logging.info(f"Overriding image_key from {reward_model.config.image_key} to {image_key_override}")
+        reward_model.config.image_key = image_key_override
 
     image_key = reward_model.config.image_key
     state_key = reward_model.config.state_key
@@ -470,6 +475,7 @@ def compute_sarm_progress(
     num_visualizations: int = 5,
     output_dir: str = "./sarm_viz",
     stride: int = 1,
+    image_key_override: str | None = None,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -483,8 +489,9 @@ def compute_sarm_progress(
         num_visualizations: Number of episodes to visualize (0 to skip)
         output_dir: Directory to save visualizations
         stride: Compute progress every N frames, interpolate the rest (default: 1 = every frame)
+        image_key_override: Override the image key from the model config
     """
-    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device)
+    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device, image_key_override)
 
     # Set preprocessor to eval mode to disable augmentations
     if hasattr(preprocess, "eval"):
@@ -786,6 +793,12 @@ Examples:
         default=1,
         help="Compute progress every N frames, interpolate the rest (default: 1 = every frame)",
     )
+    parser.add_argument(
+        "--image-key",
+        type=str,
+        default=None,
+        help="Override the image key from the model config (useful if dataset uses a different camera name)",
+    )
 
     args = parser.parse_args()
 
@@ -808,7 +821,7 @@ Examples:
     # Handle visualize-only mode
     if args.visualize_only:
         dataset, reward_model, preprocess = load_sarm_resources(
-            args.dataset_repo_id, reward_model_path, args.device
+            args.dataset_repo_id, reward_model_path, args.device, args.image_key
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
         viz_episodes = list(range(min(args.num_visualizations, dataset.num_episodes)))
@@ -834,6 +847,7 @@ Examples:
         num_visualizations=args.num_visualizations,
         output_dir=args.output_dir,
         stride=args.stride,
+        image_key_override=args.image_key,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")

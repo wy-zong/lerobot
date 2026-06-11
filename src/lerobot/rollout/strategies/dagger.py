@@ -132,6 +132,10 @@ class DAggerEvents:
         self.upload_requested = Event()
         self.save_episode_requested = Event()
         self.discard_episode_requested = Event()
+        # Backward-compatible event names used by older tests/docs and by
+        # the user-facing DAgger controls.
+        self.next_episode_requested = self.save_episode_requested
+        self.rerecord_requested = self.discard_episode_requested
 
     @property
     def phase(self) -> DAggerPhase:
@@ -277,9 +281,9 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
                 events.request_transition(key_to_event[resolved])
             if resolved == cfg.upload:
                 events.upload_requested.set()
-            if resolved == "right":
+            if resolved == cfg.next_episode:
                 events.save_episode_requested.set()
-            if resolved == "left":
+            if resolved == cfg.rerecord_episode:
                 events.discard_episode_requested.set()
         except Exception as e:
             logger.debug("Key error: %s", e)
@@ -574,6 +578,7 @@ class DAggerStrategy(RolloutStrategy):
                                 dataset, cfg, episodes_since_push
                             )
                             episode_start = time.perf_counter()
+                            record_tick = 0
                         if self.config.model_test_mode:
                             last_action = None
                             self._run_model_test_episode_reset(
@@ -654,12 +659,12 @@ class DAggerStrategy(RolloutStrategy):
                             episodes_since_push = self._after_continuous_episode_saved(
                                 dataset, cfg, episodes_since_push
                             )
+                            record_tick = 0
                             if self.config.model_test_mode:
                                 last_action = None
                                 self._run_model_test_episode_reset(
                                     ctx, engine, interpolator, events, control_interval
                                 )
-                                record_tick = 0
                         episode_start = time.perf_counter()
 
                     dt = time.perf_counter() - loop_start
@@ -743,18 +748,21 @@ class DAggerStrategy(RolloutStrategy):
                         if new_phase == DAggerPhase.AUTONOMOUS:
                             last_action = None
 
-                        if old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
-                            if dataset.has_pending_frames():
-                                with self._episode_lock:
-                                    dataset.save_episode()
-                                recorded += 1
-                                self._needs_push.set()
-                                logger.info(
-                                    "Correction %d/%d saved",
-                                    recorded,
-                                    self.config.num_episodes,
-                                )
-                                log_say(f"Correction {recorded} saved", play_sounds)
+                        if (
+                            old_phase == DAggerPhase.CORRECTING
+                            and new_phase == DAggerPhase.PAUSED
+                            and dataset.has_pending_frames()
+                        ):
+                            with self._episode_lock:
+                                dataset.save_episode()
+                            recorded += 1
+                            self._needs_push.set()
+                            logger.info(
+                                "Correction %d/%d saved",
+                                recorded,
+                                self.config.num_episodes,
+                            )
+                            log_say(f"Correction {recorded} saved", play_sounds)
 
                     if events.upload_requested.is_set():
                         events.upload_requested.clear()

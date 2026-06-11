@@ -61,6 +61,23 @@ from lerobot.robots import (  # noqa: F401
     omx_follower,
     so_follower,
 )
+from lerobot.rollout.configs import DAggerStrategyConfig, HighlightStrategyConfig, SentryStrategyConfig
+from lerobot.teleoperators import (  # noqa: F401
+    TeleoperatorConfig,
+    bi_openarm_leader,
+    bi_so_leader,
+    gamepad,
+    homunculus,
+    keyboard,
+    koch_leader,
+    make_teleoperator_from_config,
+    omx_leader,
+    openarm_leader,
+    openarm_mini,
+    reachy2_teleoperator,
+    so_leader,
+    unitree_g1,
+)
 from lerobot.transport import (
     services_pb2,  # type: ignore
     services_pb2_grpc,  # type: ignore
@@ -81,6 +98,7 @@ from .helpers import (
     map_robot_keys_to_lerobot_features,
     visualize_action_queue_size,
 )
+from .recording import RemoteDAggerController, RemoteRolloutRecorder
 
 
 def _start_keyboard_stop_listener(client: "RobotClient"):
@@ -123,6 +141,7 @@ class RobotClient:
         self.config = config
         self.robot = make_robot_from_config(config.robot)
         self.robot.connect()
+        self.initial_position = self._capture_initial_position()
 
         lerobot_features = map_robot_keys_to_lerobot_features(self.robot)
 
@@ -167,6 +186,21 @@ class RobotClient:
         self.must_go.set()  # Initially set - observations qualify for direct processing
         self.awaiting_action_chunk = threading.Event()
 
+        self.recorder = RemoteRolloutRecorder(config, self.robot, self.logger)
+        self.dagger_controller = (
+            RemoteDAggerController(
+                config,
+                self.robot,
+                self.recorder,
+                self.logger,
+                self.shutdown_event,
+                self._reset_remote_policy_state,
+                self._return_to_initial_position,
+            )
+            if isinstance(config.strategy, DAggerStrategyConfig)
+            else None
+        )
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
@@ -194,6 +228,9 @@ class RobotClient:
             self.stub.SendPolicyInstructions(policy_setup)
 
             self.shutdown_event.clear()
+            self.recorder.start(self.shutdown_event)
+            if self.dagger_controller is not None:
+                self.dagger_controller.start()
 
             return True
 
@@ -205,11 +242,45 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
 
-        self.robot.disconnect()
-        self.logger.debug("Robot disconnected")
+        if self.dagger_controller is not None:
+            self.dagger_controller.close()
+
+        self.recorder.close()
+
+        if self.robot.is_connected:
+            if self.config.return_to_initial_position and self.recorder.enabled:
+                self._return_to_initial_position()
+            self.robot.disconnect()
+            self.logger.debug("Robot disconnected")
 
         self.channel.close()
         self.logger.debug("Client stopped, channel closed")
+
+    def _capture_initial_position(self) -> dict[str, Any]:
+        try:
+            observation = self.robot.get_observation()
+        except Exception as e:
+            self.logger.warning("Could not capture initial robot position: %s", e)
+            return {}
+        return {key: value for key, value in observation.items() if key.endswith(".pos")}
+
+    def _return_to_initial_position(self, duration_s: float = 3.0, fps: int = 50) -> None:
+        if not self.initial_position or not self.robot.is_connected:
+            return
+        try:
+            current_obs = self.robot.get_observation()
+            current_pos = {key: value for key, value in current_obs.items() if key in self.initial_position}
+            steps = max(int(duration_s * fps), 1)
+            for step in range(1, steps + 1):
+                t = step / steps
+                action = {
+                    key: current_pos[key] * (1 - t) + self.initial_position[key] * t
+                    for key in current_pos
+                }
+                self.robot.send_action(action)
+                time.sleep(1 / fps)
+        except Exception as e:
+            self.logger.warning("Could not return robot to initial position: %s", e)
 
     def send_observation(
         self,
@@ -395,12 +466,28 @@ class RobotClient:
         with self.action_queue_lock:
             return not self.action_queue.empty()
 
+    def _reset_remote_policy_state(self) -> None:
+        """Discard stale client-side policy actions and force the next observation through."""
+        with self.action_queue_lock:
+            self.action_queue = Queue()
+        self.awaiting_action_chunk.clear()
+        self.must_go.set()
+
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
         return action
 
+    def _record_policy_action(self, raw_observation: RawObservation, action: dict[str, Any]) -> None:
+        if isinstance(self.config.strategy, SentryStrategyConfig):
+            self.recorder.record_sentry_action(raw_observation, action)
+        elif isinstance(self.config.strategy, HighlightStrategyConfig):
+            self.recorder.record_highlight_action(raw_observation, action)
+        elif self.dagger_controller is not None:
+            self.dagger_controller.on_policy_action(raw_observation, action)
+
     def control_loop_action(self, verbose: bool = False) -> dict[str, Any]:
         """Reading and performing actions in local queue"""
+        raw_observation: RawObservation = self.robot.get_observation()
 
         # Lock only for queue operations
         get_start = time.perf_counter()
@@ -410,9 +497,10 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        action_dict = self._action_tensor_to_action_dict(timed_action.get_action())
+        _performed_action = self.robot.send_action(action_dict)
+        action_for_recording = _performed_action or action_dict
+        self._record_policy_action(raw_observation, action_for_recording)
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
 
@@ -507,16 +595,37 @@ class RobotClient:
 
         _performed_action = None
         _captured_observation = None
+        start_time = time.perf_counter()
 
         while self.running:
             control_loop_start = time.perf_counter()
-            """Control loop: (1) Performing actions, when available"""
-            if self.actions_available():
-                _performed_action = self.control_loop_action(verbose)
+            if self.config.duration > 0 and (time.perf_counter() - start_time) >= self.config.duration:
+                self.logger.info("Duration limit reached (%.0fs)", self.config.duration)
+                self.shutdown_event.set()
+                break
 
-            """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+            if self.dagger_controller is not None:
+                self.dagger_controller.consume_controls()
+                if self.dagger_controller.events.stop_recording.is_set():
+                    self.shutdown_event.set()
+                    break
+
+                if self.dagger_controller.is_autonomous:
+                    if self.actions_available():
+                        _performed_action = self.control_loop_action(verbose)
+
+                    if self._ready_to_send_observation():
+                        _captured_observation = self.control_loop_observation(task, verbose)
+                else:
+                    _captured_observation, _performed_action = self.dagger_controller.hold_or_correct()
+            else:
+                """Control loop: (1) Performing actions, when available"""
+                if self.actions_available():
+                    _performed_action = self.control_loop_action(verbose)
+
+                """Control loop: (2) Streaming observations to the remote policy server"""
+                if self._ready_to_send_observation():
+                    _captured_observation = self.control_loop_observation(task, verbose)
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

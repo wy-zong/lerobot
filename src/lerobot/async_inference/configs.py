@@ -12,18 +12,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 from collections.abc import Callable
 from dataclasses import dataclass, field
 
 import torch
 
+from lerobot.configs.dataset import DatasetRecordConfig
 from lerobot.robots.config import RobotConfig
+from lerobot.rollout.configs import (
+    BaseStrategyConfig,
+    DAggerStrategyConfig,
+    HighlightStrategyConfig,
+    RolloutStrategyConfig,
+    SentryStrategyConfig,
+)
+from lerobot.teleoperators.config import TeleoperatorConfig
 
 from .constants import (
     DEFAULT_FPS,
     DEFAULT_INFERENCE_LATENCY,
     DEFAULT_OBS_QUEUE_TIMEOUT,
 )
+
+logger = logging.getLogger(__name__)
 
 # Aggregate function registry for CLI usage
 AGGREGATE_FUNCTIONS = {
@@ -126,6 +138,9 @@ class RobotClientConfig:
     # would be aggregated on the client side anyway, depending on the value of `chunk_size_threshold`)
     actions_per_chunk: int = field(metadata={"help": "Number of actions per chunk"})
 
+    # Optional teleoperator for DAgger corrections on the execution host.
+    teleop: TeleoperatorConfig | None = None
+
     # Task instruction for the robot to execute (e.g., 'fold my tshirt')
     task: str = field(default="", metadata={"help": "Task instruction for the robot to execute"})
 
@@ -158,6 +173,17 @@ class RobotClientConfig:
     # Debug configuration
     debug_visualize_queue_size: bool = field(
         default=False, metadata={"help": "Visualize the action queue size"}
+    )
+
+    # Rollout-style local recording on the execution host. The policy server/proto is unchanged.
+    strategy: RolloutStrategyConfig = field(default_factory=BaseStrategyConfig)
+    dataset: DatasetRecordConfig | None = None
+    duration: float = field(default=0.0, metadata={"help": "Run duration in seconds. 0 means infinite."})
+    resume: bool = field(default=False, metadata={"help": "Resume an existing local recording dataset"})
+    play_sounds: bool = field(default=True, metadata={"help": "Play audio prompts for recording events"})
+    return_to_initial_position: bool = field(
+        default=True,
+        metadata={"help": "Return robot to its initial joint position before disconnecting"},
     )
 
     @property
@@ -194,6 +220,52 @@ class RobotClientConfig:
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
 
+        if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:
+            raise ValueError("DAgger strategy requires --teleop.type to be set")
+
+        needs_dataset = isinstance(
+            self.strategy, (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig)
+        )
+        if needs_dataset and (self.dataset is None or not self.dataset.repo_id):
+            raise ValueError(f"{self.strategy.type} strategy requires --dataset.repo_id to be set")
+
+        if isinstance(self.strategy, BaseStrategyConfig) and self.dataset is not None:
+            raise ValueError(
+                "Base strategy does not record data. Use sentry, highlight, or dagger for recording."
+            )
+
+        if (
+            isinstance(self.strategy, (SentryStrategyConfig, HighlightStrategyConfig))
+            and self.dataset is not None
+            and not self.dataset.streaming_encoding
+        ):
+            logger.warning("%s mode forces streaming_encoding=True", self.strategy.type.capitalize())
+            self.dataset.streaming_encoding = True
+
+        if isinstance(self.strategy, DAggerStrategyConfig) and self.dataset is not None:
+            if self.strategy.record_autonomous and not self.dataset.streaming_encoding:
+                logger.warning("DAgger with record_autonomous=True forces streaming_encoding=True")
+                self.dataset.streaming_encoding = True
+            elif not self.strategy.record_autonomous and not self.dataset.streaming_encoding:
+                logger.info(
+                    "Streaming encoding is disabled for DAgger corrections-only mode. "
+                    "Consider enabling it for faster episode saving: "
+                    "--dataset.streaming_encoding=true --dataset.encoder_threads=2"
+                )
+            if self.strategy.num_episodes is None:
+                self.strategy.num_episodes = self.dataset.num_episodes
+                logger.info(
+                    "DAgger num_episodes not set; using --dataset.num_episodes=%d",
+                    self.strategy.num_episodes,
+                )
+
+        if self.dataset is not None and not self.dataset.single_task and self.task:
+            logger.info("Propagating top-level task '%s' to dataset config", self.task)
+            self.dataset.single_task = self.task
+        elif self.dataset is not None and self.dataset.single_task and not self.task:
+            logger.info("Propagating dataset single_task '%s' to top-level task", self.dataset.single_task)
+            self.task = self.dataset.single_task
+
         self.aggregate_fn = get_aggregate_function(self.aggregate_fn_name)
 
     @classmethod
@@ -216,4 +288,9 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "strategy": self.strategy.type,
+            "duration": self.duration,
+            "resume": self.resume,
+            "play_sounds": self.play_sounds,
+            "return_to_initial_position": self.return_to_initial_position,
         }

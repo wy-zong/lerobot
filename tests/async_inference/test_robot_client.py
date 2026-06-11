@@ -19,6 +19,7 @@ no real hardware is accessed. Only the queue-update mechanism is verified.
 
 from __future__ import annotations
 
+import logging
 import pickle  # nosec
 import sys
 import threading
@@ -26,6 +27,7 @@ import time
 from queue import Queue
 from types import ModuleType, SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
@@ -131,6 +133,38 @@ def _make_fake_pynput_module():
     return fake_pynput, fake_keyboard, FakeListener
 
 
+class _FakeDataset:
+    def __init__(self):
+        self.frames = []
+        self.saved = 0
+        self.finalized = False
+        self.pushed = 0
+        self.repo_id = "user/rollout_fake"
+
+    @property
+    def num_episodes(self):
+        return self.saved
+
+    def add_frame(self, frame):
+        self.frames.append(frame)
+
+    def save_episode(self):
+        self.saved += 1
+        self.frames.clear()
+
+    def has_pending_frames(self):
+        return bool(self.frames)
+
+    def clear_episode_buffer(self):
+        self.frames.clear()
+
+    def finalize(self):
+        self.finalized = True
+
+    def push_to_hub(self, **_kwargs):
+        self.pushed += 1
+
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
@@ -166,6 +200,227 @@ def test_robot_client_config_rejects_unknown_inference_mode():
             actions_per_chunk=20,
             inference_mode="streaming",
         )
+
+
+def test_robot_client_config_validates_rollout_recording_requirements():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig, SentryStrategyConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    base_kwargs = {
+        "robot": MockRobotConfig(),
+        "server_address": "localhost:9999",
+        "policy_type": "test",
+        "pretrained_name_or_path": "test",
+        "actions_per_chunk": 20,
+    }
+
+    RobotClientConfig(**base_kwargs)
+
+    with pytest.raises(ValueError, match="dataset.repo_id"):
+        RobotClientConfig(**base_kwargs, strategy=SentryStrategyConfig())
+
+    with pytest.raises(ValueError, match="teleop.type"):
+        RobotClientConfig(
+            **base_kwargs,
+            strategy=DAggerStrategyConfig(),
+            dataset=DatasetRecordConfig(repo_id="user/rollout_dagger"),
+        )
+
+    dataset = DatasetRecordConfig(repo_id="user/rollout_dagger", streaming_encoding=False)
+    cfg = RobotClientConfig(
+        **base_kwargs,
+        strategy=DAggerStrategyConfig(record_autonomous=True),
+        dataset=dataset,
+        teleop=MockTeleopConfig(),
+    )
+
+    assert cfg.dataset.streaming_encoding is True
+
+
+def test_remote_recorder_builds_features_and_frames(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    fake_dataset = _FakeDataset()
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+
+    robot = MockRobot(MockRobotConfig(n_motors=3, random_values=False, static_values=[1, 2, 3]))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        task="pick",
+        strategy=DAggerStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_features", video=False),
+        teleop=MockTeleopConfig(),
+    )
+
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    frame = recorder.build_frame(
+        {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+        {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0},
+        intervention=True,
+    )
+
+    assert "intervention" in recorder.features
+    assert frame["task"] == "pick"
+    np.testing.assert_array_equal(frame["observation.state"], np.array([1, 2, 3], dtype=np.float32))
+    np.testing.assert_array_equal(frame["action"], np.array([4, 5, 6], dtype=np.float32))
+    np.testing.assert_array_equal(frame["intervention"], np.array([True], dtype=bool))
+
+
+def test_remote_sentry_recorder_rotates_and_queues_push(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import SentryStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    fake_dataset = _FakeDataset()
+    push_calls = []
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+    monkeypatch.setattr(RemoteRolloutRecorder, "background_push", lambda self: push_calls.append(self))
+
+    robot = MockRobot(MockRobotConfig(n_motors=3))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=SentryStrategyConfig(upload_every_n_episodes=1),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_sentry", video=False),
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    recorder.episode_duration_s = 0.01
+    recorder._episode_start = time.perf_counter() - 1.0
+
+    recorder.record_sentry_action(
+        {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+        {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0},
+    )
+
+    assert fake_dataset.saved == 1
+    assert push_calls == [recorder]
+
+
+def test_remote_highlight_recorder_buffers_saves_and_pushes(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import HighlightStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    fake_dataset = _FakeDataset()
+    push_calls = []
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+    monkeypatch.setattr(RemoteRolloutRecorder, "background_push", lambda self: push_calls.append(self))
+
+    robot = MockRobot(MockRobotConfig(n_motors=3))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=HighlightStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_highlight", video=False),
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    obs = {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0}
+    action = {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0}
+
+    recorder.record_highlight_action(obs, action)
+    assert len(recorder._ring) == 1
+    assert fake_dataset.frames == []
+
+    recorder._save_requested.set()
+    recorder.record_highlight_action(obs, action)
+    assert len(fake_dataset.frames) == 2
+
+    recorder._push_requested.set()
+    recorder.record_highlight_action(obs, action)
+    assert push_calls == [recorder]
+
+    recorder._save_requested.set()
+    recorder.record_highlight_action(obs, action)
+    assert fake_dataset.saved == 1
+
+
+def test_remote_dagger_corrections_only_records_interventions(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteDAggerController, RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    fake_dataset = _FakeDataset()
+    clear_calls = []
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+
+    robot = MockRobot(MockRobotConfig(n_motors=3, random_values=False, static_values=[0, 0, 0]))
+    robot.connect()
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=DAggerStrategyConfig(num_episodes=1),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_dagger", video=False),
+        teleop=MockTeleopConfig(random_values=False, static_values=[1, 2, 3]),
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    shutdown_event = threading.Event()
+    controller = RemoteDAggerController(
+        cfg,
+        robot,
+        recorder,
+        logging.getLogger("test"),
+        shutdown_event,
+        lambda: clear_calls.append("clear"),
+        lambda: None,
+    )
+    controller.start()
+
+    controller.on_policy_action(
+        {"motor_1.pos": 0.0, "motor_2.pos": 0.0, "motor_3.pos": 0.0},
+        {"motor_1.pos": 0.0, "motor_2.pos": 0.0, "motor_3.pos": 0.0},
+    )
+    assert fake_dataset.frames == []
+
+    controller.events.request_transition("pause_resume")
+    controller.consume_controls()
+    assert controller.phase == DAggerPhase.PAUSED
+
+    controller.events.request_transition("correction")
+    controller.consume_controls()
+    observation, action = controller.hold_or_correct()
+    assert observation is not None
+    assert action == {"motor_1.pos": 1, "motor_2.pos": 2, "motor_3.pos": 3}
+    np.testing.assert_array_equal(fake_dataset.frames[-1]["intervention"], np.array([True]))
+
+    controller.events.request_transition("correction")
+    controller.consume_controls()
+
+    assert controller.phase == DAggerPhase.PAUSED
+    assert fake_dataset.saved == 1
+    assert controller.events.stop_recording.is_set()
+    assert clear_calls
+
+    controller.close()
+    robot.disconnect()
 
 
 def test_keyboard_stop_listener_sets_shutdown_on_escape(monkeypatch):

@@ -140,7 +140,7 @@ def to_numpy_image(img) -> np.ndarray:
 
 
 def visualize_episode(
-    frames, progress_preds, stage_preds, title, output_path, stage_labels, gt_progress=None, gt_stages=None
+    frames, progress_preds, stage_preds, title, output_path, stage_labels, gt_progress=None, gt_stages=None, display_indices=None
 ):
     """Create visualization with progress plot, stage probabilities, and sample frames.
 
@@ -187,20 +187,21 @@ def visualize_episode(
 
     # Sample frames
     ax_frames.axis("off")
-    num_sample = 8
-    sample_indices = np.linspace(0, len(frames) - 1, num_sample, dtype=int)
+    num_sample = len(frames)
     h, w = frames[0].shape[:2]
     combined = np.zeros((h, w * num_sample, 3), dtype=np.uint8)
-    for i, idx in enumerate(sample_indices):
-        frame = frames[idx]
+    for i in range(num_sample):
+        frame = frames[i]
+        real_idx = display_indices[i] if display_indices is not None else int(i * (len(progress_preds) - 1) / max(1, num_sample - 1))
+        
         if frame.shape[-1] == 1:
             frame = np.repeat(frame, 3, axis=-1)
         combined[:, i * w : (i + 1) * w] = frame
-        stage_name = stage_labels[np.argmax(stage_preds[idx])][:12]
+        stage_name = stage_labels[np.argmax(stage_preds[real_idx])][:15]
         ax_frames.text(
             i * w + w / 2,
             -10,
-            f"Frame {idx}\n{progress_preds[idx]:.2f}\n{stage_name}",
+            f"Frame {real_idx}\n{progress_preds[real_idx]:.2f}\n{stage_name}",
             ha="center",
             va="top",
             fontsize=7,
@@ -409,7 +410,10 @@ def visualize_sarm_predictions(
                     sd["viz_stages"] = np.nan_to_num(sd["viz_stages"], nan=0.0)
 
         # Generate visualization for each head
-        ordered_viz_frames = [viz_frames[idx] for idx in sorted(display_indices)]
+        ordered_display_indices = sorted(display_indices)
+        ordered_viz_frames = [viz_frames[idx] for idx in ordered_display_indices]
+        # Make indices relative to the episode start for stage_preds/progress_preds array indexing
+        relative_display_indices = [idx - ep_start for idx in ordered_display_indices]
         for scheme in schemes_to_viz:
             sd = scheme_data[scheme]
             stage_labels = sd["subtask_names"] or [f"Stage {i + 1}" for i in range(sd["num_stages"])]
@@ -424,6 +428,7 @@ def visualize_sarm_predictions(
                 stage_labels=stage_labels,
                 gt_progress=sd["viz_gt_progress"] if not np.all(np.isnan(sd["viz_gt_progress"])) else None,
                 gt_stages=sd["viz_gt_stages"] if not np.all(np.isnan(sd["viz_gt_stages"])) else None,
+                display_indices=relative_display_indices,
             )
 
         # Clear memory between episodes

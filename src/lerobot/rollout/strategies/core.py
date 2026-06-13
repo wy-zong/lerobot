@@ -198,7 +198,11 @@ def safe_push_to_hub(dataset, tags=None, private=False) -> bool:
     if dataset.num_episodes == 0:
         logger.warning("No episodes saved — skipping push to hub")
         return False
-    dataset.push_to_hub(tags=tags, private=private)
+    try:
+        dataset.push_to_hub(tags=tags, private=private)
+    except Exception as e:
+        logger.error("Push to hub failed: %s", e)
+        return False
     return True
 
 

@@ -20,8 +20,6 @@ import contextlib
 import dataclasses
 from threading import Event
 from types import SimpleNamespace
-from threading import Event
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -231,6 +229,20 @@ def test_create_strategy_unknown_raises():
     cfg.type = "bogus"
     with pytest.raises(ValueError, match="Unknown strategy type"):
         create_strategy(cfg)
+
+
+def test_safe_push_to_hub_failure_is_non_fatal(caplog):
+    from lerobot.rollout.strategies.core import safe_push_to_hub
+
+    dataset = MagicMock()
+    dataset.num_episodes = 1
+    dataset.push_to_hub.side_effect = RuntimeError("forbidden")
+
+    with caplog.at_level("ERROR"):
+        assert safe_push_to_hub(dataset, tags=["test"], private=True) is False
+
+    dataset.push_to_hub.assert_called_once_with(tags=["test"], private=True)
+    assert "Push to hub failed: forbidden" in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -609,6 +621,99 @@ def test_dagger_full_transition_cycle():
     events.request_transition("pause_resume")
     old, new = events.consume_transition()
     assert (old, new) == (DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS)
+
+
+def test_dagger_middle_mouse_click_requests_correction(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_module
+    from lerobot.rollout.strategies import DAggerEvents, DAggerPhase
+
+    middle_button = object()
+
+    class FakeMouseListener:
+        instances = []
+
+        def __init__(self, on_click):
+            self.on_click = on_click
+            self.started = False
+            self.stopped = False
+            self.instances.append(self)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.stopped = True
+
+    fake_mouse = SimpleNamespace(
+        Button=SimpleNamespace(middle=middle_button),
+        Listener=FakeMouseListener,
+    )
+    events = DAggerEvents()
+    events.request_transition("pause_resume")
+    assert events.consume_transition() == (DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED)
+
+    monkeypatch.setattr(dagger_module, "PYNPUT_AVAILABLE", True)
+    monkeypatch.setattr(dagger_module, "mouse", fake_mouse)
+    monkeypatch.setattr(dagger_module, "is_headless", lambda: False)
+
+    listener = dagger_module._init_dagger_mouse(events)
+    listener.on_click(0, 0, middle_button, True)
+
+    assert listener.started
+    assert events.consume_transition() == (DAggerPhase.PAUSED, DAggerPhase.CORRECTING)
+
+
+def test_dagger_autonomous_to_paused_smooth_handover_preserves_prefixed_keys(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_module
+    from lerobot.rollout.strategies import DAggerPhase, DAggerStrategy
+
+    handovers = []
+    teleop = SimpleNamespace(feedback_features={"left_motor.pos": float, "right_motor.pos": float})
+    teleop.enable_torque = MagicMock()
+    teleop.disable_torque = MagicMock()
+    robot = MagicMock()
+    ctx = SimpleNamespace(hardware=SimpleNamespace(teleop=teleop, robot_wrapper=robot))
+    prev_action = {"left_motor.pos": 1.0, "right_motor.pos": 2.0}
+
+    monkeypatch.setattr(
+        dagger_module,
+        "_teleop_smooth_move_to",
+        lambda teleop_arg, target: handovers.append((teleop_arg, target.copy())),
+    )
+
+    DAggerStrategy._apply_transition(
+        DAggerPhase.AUTONOMOUS,
+        DAggerPhase.PAUSED,
+        MagicMock(),
+        MagicMock(),
+        ctx,
+        prev_action,
+    )
+
+    assert handovers == [(teleop, prev_action)]
+    robot.send_action.assert_not_called()
+
+
+def test_dagger_teleop_smooth_move_to_preserves_bimanual_feedback(monkeypatch):
+    import lerobot.rollout.strategies.dagger as dagger_module
+
+    feedback_calls = []
+    teleop = SimpleNamespace(
+        get_action=MagicMock(return_value={"left_motor.pos": 0.0, "right_motor.pos": 10.0}),
+        send_feedback=MagicMock(side_effect=lambda feedback: feedback_calls.append(feedback.copy())),
+        enable_torque=MagicMock(),
+    )
+
+    monkeypatch.setattr(dagger_module.time, "sleep", lambda _seconds: None)
+
+    dagger_module._teleop_smooth_move_to(
+        teleop,
+        {"left_motor.pos": 4.0, "right_motor.pos": 14.0},
+        duration_s=0.0,
+    )
+
+    teleop.enable_torque.assert_called_once()
+    assert feedback_calls[-1] == {"left_motor.pos": 4.0, "right_motor.pos": 14.0}
 
 
 def test_dagger_invalid_transition_ignored():

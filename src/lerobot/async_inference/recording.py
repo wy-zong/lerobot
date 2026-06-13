@@ -48,6 +48,11 @@ from lerobot.rollout.configs import (
 from lerobot.rollout.ring_buffer import RolloutRingBuffer
 from lerobot.rollout.strategies import DAggerEvents, DAggerPhase, estimate_max_episode_seconds
 from lerobot.rollout.strategies.core import safe_push_to_hub
+from lerobot.rollout.strategies.dagger import (
+    _init_dagger_mouse,
+    _teleop_smooth_move_to,
+    _teleop_supports_feedback,
+)
 from lerobot.teleoperators import Teleoperator, make_teleoperator_from_config
 from lerobot.utils.constants import ACTION, OBS_STR
 from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts, hw_to_dataset_features
@@ -454,6 +459,7 @@ class RemoteDAggerController:
         self.events = DAggerEvents()
         self.teleop: Teleoperator | None = None
         self._listener = None
+        self._mouse_listener = None
         self._pedal_thread = None
         self.last_action: dict[str, Any] | None = None
         self.recorded_corrections = 0
@@ -473,12 +479,16 @@ class RemoteDAggerController:
             self._listener = self._init_keyboard(self.events, self.strategy.keyboard)
         else:
             self._pedal_thread = self._init_pedal(self.events, self.strategy.pedal)
+        self._mouse_listener = _init_dagger_mouse(self.events)
         self.logger.info("Remote DAgger controller started (input=%s)", self.strategy.input_device)
 
     def close(self) -> None:
         if self._listener is not None:
             self._listener.stop()
             self._listener = None
+        if self._mouse_listener is not None:
+            self._mouse_listener.stop()
+            self._mouse_listener = None
         if self.teleop is not None and self.teleop.is_connected:
             self.teleop.disconnect()
 
@@ -584,14 +594,25 @@ class RemoteDAggerController:
 
     def _apply_transition(self, old_phase: DAggerPhase, new_phase: DAggerPhase) -> None:
         self.logger.info("DAgger phase transition: %s -> %s", old_phase.value, new_phase.value)
-        if new_phase == DAggerPhase.AUTONOMOUS:
+        teleop_supports_feedback = self.teleop is not None and _teleop_supports_feedback(self.teleop)
+
+        if old_phase == DAggerPhase.AUTONOMOUS and new_phase == DAggerPhase.PAUSED:
+            self.clear_remote_policy_state()
+            if teleop_supports_feedback and self.last_action is not None:
+                self.logger.info("Smooth handover: moving leader arm to follower position")
+                _teleop_smooth_move_to(self.teleop, self.last_action)
+        elif old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING:
+            self.clear_remote_policy_state()
+            if teleop_supports_feedback:
+                self.teleop.disable_torque()
+        elif old_phase == DAggerPhase.CORRECTING and new_phase == DAggerPhase.PAUSED:
+            if teleop_supports_feedback:
+                self.teleop.enable_torque()
+        elif new_phase == DAggerPhase.AUTONOMOUS:
             self.clear_remote_policy_state()
             self.last_action = None
-        elif (
-            (old_phase == DAggerPhase.AUTONOMOUS and new_phase == DAggerPhase.PAUSED)
-            or (old_phase == DAggerPhase.PAUSED and new_phase == DAggerPhase.CORRECTING)
-        ):
-            self.clear_remote_policy_state()
+            if teleop_supports_feedback:
+                self.teleop.disable_torque()
 
     def _run_model_test_episode_reset(self) -> None:
         if not self.strategy.record_autonomous:

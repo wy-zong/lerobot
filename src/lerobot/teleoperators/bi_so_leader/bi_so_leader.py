@@ -65,7 +65,13 @@ class BiSOLeader(Teleoperator):
 
     @cached_property
     def feedback_features(self) -> dict[str, type]:
-        return {}
+        left_arm_features = self.left_arm.feedback_features
+        right_arm_features = self.right_arm.feedback_features
+
+        return {
+            **{f"left_{k}": v for k, v in left_arm_features.items()},
+            **{f"right_{k}": v for k, v in right_arm_features.items()},
+        }
 
     @property
     def is_connected(self) -> bool:
@@ -88,6 +94,14 @@ class BiSOLeader(Teleoperator):
         self.left_arm.configure()
         self.right_arm.configure()
 
+    def enable_torque(self) -> None:
+        self.left_arm.enable_torque()
+        self.right_arm.enable_torque()
+
+    def disable_torque(self) -> None:
+        self.left_arm.disable_torque()
+        self.right_arm.disable_torque()
+
     def setup_motors(self) -> None:
         self.left_arm.setup_motors()
         self.right_arm.setup_motors()
@@ -106,9 +120,19 @@ class BiSOLeader(Teleoperator):
 
         return action_dict
 
+    @check_if_not_connected
     def send_feedback(self, feedback: dict[str, float]) -> None:
-        # TODO: Implement force feedback
-        raise NotImplementedError
+        left_feedback = {
+            key.removeprefix("left_"): value for key, value in feedback.items() if key.startswith("left_")
+        }
+        right_feedback = {
+            key.removeprefix("right_"): value
+            for key, value in feedback.items()
+            if key.startswith("right_")
+        }
+
+        self.left_arm.send_feedback(left_feedback)
+        self.right_arm.send_feedback(right_feedback)
 
     @check_if_not_connected
     def disconnect(self) -> None:

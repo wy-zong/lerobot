@@ -165,6 +165,21 @@ class _FakeDataset:
         self.pushed += 1
 
 
+class _ActuatedTeleop:
+    feedback_features = {"left_motor.pos": float, "right_motor.pos": float}
+
+    def __init__(self):
+        self.enable_calls = 0
+        self.disable_calls = 0
+        self.is_connected = True
+
+    def enable_torque(self):
+        self.enable_calls += 1
+
+    def disable_torque(self):
+        self.disable_calls += 1
+
+
 # -----------------------------------------------------------------------------
 # Tests
 # -----------------------------------------------------------------------------
@@ -421,6 +436,68 @@ def test_remote_dagger_corrections_only_records_interventions(monkeypatch):
 
     controller.close()
     robot.disconnect()
+
+
+def test_remote_dagger_actuated_handover_and_torque_transitions(monkeypatch):
+    import lerobot.async_inference.recording as recording_module
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteDAggerController
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    clear_calls = []
+    handovers = []
+    last_action = {"left_motor.pos": 1.0, "right_motor.pos": 2.0}
+    teleop = _ActuatedTeleop()
+
+    monkeypatch.setattr(
+        recording_module,
+        "_teleop_smooth_move_to",
+        lambda teleop_arg, target: handovers.append((teleop_arg, target.copy())),
+    )
+
+    robot = MockRobot(MockRobotConfig(n_motors=2))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=DAggerStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_dagger", video=False),
+        teleop=MockTeleopConfig(),
+    )
+    controller = RemoteDAggerController(
+        cfg,
+        robot,
+        SimpleNamespace(),
+        logging.getLogger("test"),
+        threading.Event(),
+        lambda: clear_calls.append("clear"),
+        lambda: None,
+    )
+    controller.teleop = teleop
+    controller.last_action = last_action.copy()
+
+    controller._apply_transition(DAggerPhase.AUTONOMOUS, DAggerPhase.PAUSED)
+    assert clear_calls == ["clear"]
+    assert handovers == [(teleop, last_action)]
+    assert controller.last_action == last_action
+
+    controller._apply_transition(DAggerPhase.PAUSED, DAggerPhase.CORRECTING)
+    assert clear_calls == ["clear", "clear"]
+    assert teleop.disable_calls == 1
+
+    controller._apply_transition(DAggerPhase.CORRECTING, DAggerPhase.PAUSED)
+    assert teleop.enable_calls == 1
+
+    controller._apply_transition(DAggerPhase.PAUSED, DAggerPhase.AUTONOMOUS)
+    assert clear_calls == ["clear", "clear", "clear"]
+    assert controller.last_action is None
+    assert teleop.disable_calls == 2
 
 
 def test_robot_client_display_data_logs_policy_actions(monkeypatch, robot_client):

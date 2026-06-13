@@ -153,15 +153,48 @@ class SOFollower(Robot):
         print("Calibration saved to", self.calibration_fpath)
 
     def configure(self) -> None:
+        default_profile = {
+            "maximum_acceleration": 254,
+            "acceleration": 254,
+            "p": 16,
+            "i": 0,
+            "d": 32,
+        }
+        smoother_profiles = {
+            "shoulder_lift": {
+                "maximum_acceleration": 120,
+                "acceleration": 120,
+                "p": 24,
+                "i": 8,
+                "d": 32,
+            },
+            "elbow_flex": {
+                "maximum_acceleration": 120,
+                "acceleration": 120,
+                "p": 20,
+                "i": 4,
+                "d": 16,
+            },
+            "wrist_flex": {
+                "maximum_acceleration": 120,
+                "acceleration": 120,
+                "p": 16,
+                "i": 0,
+                "d": 16,
+            },
+        }
+
         with self.bus.torque_disabled():
             self.bus.configure_motors()
             for motor in self.bus.motors:
+                profile = smoother_profiles.get(motor, default_profile)
+
                 self.bus.write("Operating_Mode", motor, OperatingMode.POSITION.value)
-                # Set P_Coefficient to lower value to avoid shakiness (Default is 32)
-                self.bus.write("P_Coefficient", motor, 16)
-                # Set I_Coefficient and D_Coefficient to default value 0 and 32
-                self.bus.write("I_Coefficient", motor, 0)
-                self.bus.write("D_Coefficient", motor, 32)
+                self.bus.write("Maximum_Acceleration", motor, profile["maximum_acceleration"])
+                self.bus.write("Acceleration", motor, profile["acceleration"])
+                self.bus.write("P_Coefficient", motor, profile["p"])
+                self.bus.write("I_Coefficient", motor, profile["i"])
+                self.bus.write("D_Coefficient", motor, profile["d"])
 
                 if motor == "gripper":
                     self.bus.write("Max_Torque_Limit", motor, 500)  # 50% of max torque to avoid burnout

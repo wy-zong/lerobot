@@ -79,13 +79,14 @@ from .core import (
 
 PYNPUT_AVAILABLE = _pynput_available
 keyboard = None
+mouse = None
 if PYNPUT_AVAILABLE:
     try:
         if ("DISPLAY" not in os.environ) and ("linux" in sys.platform):
             logging.info("No DISPLAY set. Skipping pynput import.")
             PYNPUT_AVAILABLE = False
         else:
-            from pynput import keyboard
+            from pynput import keyboard, mouse
     except Exception as e:
         PYNPUT_AVAILABLE = False
         logging.info(f"Could not import pynput: {e}")
@@ -300,6 +301,25 @@ def _init_dagger_keyboard(events: DAggerEvents, cfg: DAggerKeyboardConfig):
     return listener
 
 
+def _init_dagger_mouse(events: DAggerEvents):
+    """Initialise middle-mouse correction toggle as an extra DAgger control."""
+    if not PYNPUT_AVAILABLE or is_headless():
+        logger.warning("Headless environment or pynput unavailable -- mouse controls disabled")
+        return None
+
+    def on_click(_x, _y, button, pressed):
+        try:
+            if pressed and button == mouse.Button.middle:
+                events.request_transition("correction")
+        except Exception as e:
+            logger.debug("Mouse control error: %s", e)
+
+    listener = mouse.Listener(on_click=on_click)
+    listener.start()
+    logger.info("DAgger mouse listener started (middle click=correction toggle)")
+    return listener
+
+
 def _init_dagger_pedal(events: DAggerEvents, cfg: DAggerPedalConfig):
     """Initialise foot pedal listener with DAgger 3-pedal controls."""
     code_to_event = {
@@ -330,6 +350,7 @@ class DAggerStrategy(RolloutStrategy):
     def __init__(self, config: DAggerStrategyConfig):
         super().__init__(config)
         self._listener = None
+        self._mouse_listener = None
         self._pedal_thread = None
         self._events = DAggerEvents()
         self._push_executor: ThreadPoolExecutor | None = None
@@ -350,6 +371,7 @@ class DAggerStrategy(RolloutStrategy):
             self._listener = _init_dagger_keyboard(self._events, self.config.keyboard)
         else:
             self._pedal_thread = _init_dagger_pedal(self._events, self.config.pedal)
+        self._mouse_listener = _init_dagger_mouse(self._events)
 
         record_mode = "all frames (sentry-like)" if self.config.record_autonomous else "corrections only"
         logger.info(
@@ -376,6 +398,10 @@ class DAggerStrategy(RolloutStrategy):
         if self._listener is not None and not is_headless():
             logger.info("Stopping keyboard listener")
             self._listener.stop()
+
+        if self._mouse_listener is not None and not is_headless():
+            logger.info("Stopping mouse listener")
+            self._mouse_listener.stop()
 
         if self._push_executor is not None:
             logger.info("Shutting down push executor (waiting for pending pushes)...")

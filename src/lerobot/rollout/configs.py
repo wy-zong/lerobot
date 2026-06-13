@@ -141,6 +141,10 @@ class DAggerStrategyConfig(RolloutStrategyConfig):
     4. **rerecord_episode** — discard the current in-progress episode.
     5. **upload** — push dataset to hub on demand (corrections-only mode).
 
+    The middle mouse button is also registered as an extra correction toggle
+    when ``pynput`` mouse controls are available; it does not replace the
+    configured keyboard or pedal controls.
+
     When ``record_autonomous=False`` (default) only human-correction windows
     are recorded — each correction becomes its own episode.  Set to ``True``
     to record both autonomous and correction frames with size-based episode

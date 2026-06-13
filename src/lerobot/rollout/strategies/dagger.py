@@ -464,6 +464,18 @@ class DAggerStrategy(RolloutStrategy):
             episodes_since_push = 0
         return episodes_since_push
 
+    def _continuous_target_reached(self, dataset) -> bool:
+        target = self.config.num_episodes
+        if target is None or dataset.num_episodes < target:
+            return False
+        logger.info(
+            "DAgger target episode count reached (%d/%d); stopping recording",
+            dataset.num_episodes,
+            target,
+        )
+        self._events.stop_recording.set()
+        return True
+
     def _reset_model_test_policy_state(self, engine, interpolator) -> None:
         """Clear rollout-side policy state before or after a model-test reset."""
         interpolator.reset()
@@ -557,7 +569,11 @@ class DAggerStrategy(RolloutStrategy):
 
         with VideoEncodingManager(dataset):
             try:
-                while not events.stop_recording.is_set() and not ctx.runtime.shutdown_event.is_set():
+                while (
+                    (self.config.num_episodes is None or dataset.num_episodes < self.config.num_episodes)
+                    and not events.stop_recording.is_set()
+                    and not ctx.runtime.shutdown_event.is_set()
+                ):
                     loop_start = time.perf_counter()
 
                     if cfg.duration > 0 and (time.perf_counter() - start_time) >= cfg.duration:
@@ -587,6 +603,8 @@ class DAggerStrategy(RolloutStrategy):
                                 episodes_since_push = self._after_continuous_episode_saved(
                                     dataset, cfg, episodes_since_push
                                 )
+                                if self._continuous_target_reached(dataset):
+                                    break
                             last_action = None
                             self._run_model_test_episode_reset(
                                 ctx, engine, interpolator, events, control_interval
@@ -605,6 +623,8 @@ class DAggerStrategy(RolloutStrategy):
                             )
                             episode_start = time.perf_counter()
                             record_tick = 0
+                            if self._continuous_target_reached(dataset):
+                                break
                         if self.config.model_test_mode:
                             last_action = None
                             self._run_model_test_episode_reset(
@@ -686,6 +706,8 @@ class DAggerStrategy(RolloutStrategy):
                                 dataset, cfg, episodes_since_push
                             )
                             record_tick = 0
+                            if self._continuous_target_reached(dataset):
+                                break
                             if self.config.model_test_mode:
                                 last_action = None
                                 self._run_model_test_episode_reset(

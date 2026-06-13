@@ -892,6 +892,29 @@ def test_dagger_continuous_right_arrow_saves_and_resets_record_counter(monkeypat
     assert dataset.num_episodes == 2
 
 
+def test_dagger_continuous_stops_after_target_episode(monkeypatch):
+    dataset = _FakeContinuousDataset()
+    shutdown_event = Event()
+    strategy, ctx, robot = _make_dagger_continuous_strategy(monkeypatch, dataset, shutdown_event)
+    strategy.config.num_episodes = 1
+    observations = 0
+
+    def get_observation():
+        nonlocal observations
+        observations += 1
+        strategy._events.next_episode_requested.set()
+        return {"x": 0.0}
+
+    robot.get_observation.side_effect = get_observation
+
+    strategy._run_continuous(ctx)
+
+    assert dataset.add_frame_calls == 1
+    assert dataset.save_episode_calls == 1
+    assert dataset.num_episodes == 1
+    assert strategy._events.stop_recording.is_set()
+
+
 def test_dagger_continuous_left_arrow_discards_in_progress_episode(monkeypatch):
     from lerobot.rollout.strategies import DAggerPhase
 

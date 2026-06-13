@@ -277,6 +277,13 @@ def test_robot_client_config_validates_rollout_recording_requirements():
             dataset=DatasetRecordConfig(repo_id="user/rollout_dagger"),
         )
 
+    with pytest.raises(ValueError, match="dataset fps must match robot client fps"):
+        RobotClientConfig(
+            **base_kwargs,
+            strategy=SentryStrategyConfig(),
+            dataset=DatasetRecordConfig(repo_id="user/rollout_sentry", fps=60),
+        )
+
     dataset = DatasetRecordConfig(repo_id="user/rollout_dagger", streaming_encoding=False)
     cfg = RobotClientConfig(
         **base_kwargs,
@@ -469,6 +476,58 @@ def test_remote_dagger_corrections_only_records_interventions(monkeypatch):
 
     controller.close()
     robot.disconnect()
+
+
+def test_remote_dagger_record_autonomous_stops_at_target_episode(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteDAggerController, RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    fake_dataset = _FakeDataset()
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+
+    robot = MockRobot(MockRobotConfig(n_motors=3, random_values=False, static_values=[0, 0, 0]))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=DAggerStrategyConfig(num_episodes=1, record_autonomous=True, model_test_mode=True),
+        dataset=DatasetRecordConfig(
+            repo_id="user/rollout_dagger",
+            video=False,
+            reset_time_s=0,
+        ),
+        teleop=MockTeleopConfig(),
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    shutdown_event = threading.Event()
+    reset_calls = []
+    controller = RemoteDAggerController(
+        cfg,
+        robot,
+        recorder,
+        logging.getLogger("test"),
+        shutdown_event,
+        lambda: None,
+        lambda: reset_calls.append("reset"),
+    )
+
+    controller.on_policy_action(
+        {"motor_1.pos": 0.0, "motor_2.pos": 0.0, "motor_3.pos": 0.0},
+        {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+    )
+    controller.events.save_episode_requested.set()
+    controller.consume_controls()
+
+    assert fake_dataset.saved == 1
+    assert controller.events.stop_recording.is_set()
+    assert shutdown_event.is_set()
+    assert reset_calls == []
 
 
 def test_remote_dagger_actuated_handover_and_torque_transitions(monkeypatch):

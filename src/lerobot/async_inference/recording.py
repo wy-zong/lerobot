@@ -513,7 +513,9 @@ class RemoteDAggerController:
 
         if self.events.save_episode_requested.is_set():
             self.events.save_episode_requested.clear()
-            self._save_continuous_episode()
+            target_reached = self._save_continuous_episode()
+            if target_reached:
+                return
             if self.strategy.model_test_mode and self.strategy.record_autonomous:
                 self._run_model_test_episode_reset()
 
@@ -523,15 +525,15 @@ class RemoteDAggerController:
             if self.strategy.model_test_mode and self.strategy.record_autonomous:
                 self._run_model_test_episode_reset()
 
-        if (
-            self.strategy.record_autonomous
-            and self.phase != DAggerPhase.CORRECTING
-            and self.recorder.maybe_rotate_episode(
+        if self.strategy.record_autonomous and self.phase != DAggerPhase.CORRECTING:
+            rotated = self.recorder.maybe_rotate_episode(
                 upload_every_n_episodes=self.strategy.upload_every_n_episodes
             )
-            and self.strategy.model_test_mode
-        ):
-            self._run_model_test_episode_reset()
+            if rotated:
+                if self._stop_if_target_reached():
+                    return
+                if self.strategy.model_test_mode:
+                    self._run_model_test_episode_reset()
 
     def hold_or_correct(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         if self.phase == DAggerPhase.PAUSED:
@@ -571,7 +573,9 @@ class RemoteDAggerController:
     def _handle_correction_finished(self) -> None:
         if self.strategy.record_autonomous:
             if self.strategy.model_test_mode:
-                self._save_continuous_episode()
+                target_reached = self._save_continuous_episode()
+                if target_reached:
+                    return
                 self._run_model_test_episode_reset()
             return
 
@@ -585,12 +589,28 @@ class RemoteDAggerController:
             if self.recorded_corrections >= self.strategy.num_episodes:
                 self.events.stop_recording.set()
 
-    def _save_continuous_episode(self) -> None:
+    def _save_continuous_episode(self) -> bool:
         if self.recorder.save_episode_if_pending(
             require_pending=True,
             upload_every_n_episodes=self.strategy.upload_every_n_episodes,
         ):
             self.recorder.reset_episode_timer()
+            return self._stop_if_target_reached()
+        return False
+
+    def _stop_if_target_reached(self) -> bool:
+        target = self.strategy.num_episodes
+        dataset = self.recorder.dataset
+        if target is None or dataset is None or dataset.num_episodes < target:
+            return False
+        self.logger.info(
+            "DAgger target episode count reached (%d/%d); stopping recording",
+            dataset.num_episodes,
+            target,
+        )
+        self.events.stop_recording.set()
+        self.shutdown_event.set()
+        return True
 
     def _apply_transition(self, old_phase: DAggerPhase, new_phase: DAggerPhase) -> None:
         self.logger.info("DAgger phase transition: %s -> %s", old_phase.value, new_phase.value)

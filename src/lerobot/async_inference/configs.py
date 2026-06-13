@@ -249,6 +249,13 @@ class RobotClientConfig:
         if needs_dataset and (self.dataset is None or not self.dataset.repo_id):
             raise ValueError(f"{self.strategy.type} strategy requires --dataset.repo_id to be set")
 
+        if needs_dataset and self.dataset is not None and self.dataset.fps != self.fps:
+            raise ValueError(
+                "Recording dataset fps must match robot client fps "
+                f"({self.dataset.fps} != {self.fps}). "
+                "Set both --fps and --dataset.fps to the same value."
+            )
+
         if isinstance(self.strategy, BaseStrategyConfig) and self.dataset is not None:
             raise ValueError(
                 "Base strategy does not record data. Use sentry, highlight, or dagger for recording."

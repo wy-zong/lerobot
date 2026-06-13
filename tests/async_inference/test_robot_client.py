@@ -217,6 +217,39 @@ def test_robot_client_config_rejects_unknown_inference_mode():
         )
 
 
+def test_robot_client_config_accepts_intra_chunk_smoothing():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    config = RobotClientConfig(
+        robot=MockRobotConfig(),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        intra_chunk_smoothing=True,
+    )
+
+    assert config.intra_chunk_smoothing is True
+    assert config.intra_chunk_smoothing_degree == 3
+
+
+def test_robot_client_config_rejects_non_cubic_intra_chunk_smoothing_degree():
+    from lerobot.async_inference.configs import RobotClientConfig
+    from tests.mocks.mock_robot import MockRobotConfig
+
+    with pytest.raises(ValueError, match="degree=3"):
+        RobotClientConfig(
+            robot=MockRobotConfig(),
+            server_address="localhost:9999",
+            policy_type="test",
+            pretrained_name_or_path="test",
+            actions_per_chunk=20,
+            intra_chunk_smoothing=True,
+            intra_chunk_smoothing_degree=2,
+        )
+
+
 def test_robot_client_config_validates_rollout_recording_requirements():
     from lerobot.async_inference.configs import RobotClientConfig
     from lerobot.configs.dataset import DatasetRecordConfig
@@ -669,6 +702,30 @@ def test_aggregate_action_queues_combines_actions_in_overlap(
         weight_old * current_actions[1].get_action() + weight_new * incoming[-2].get_action(),
     )
     assert torch.allclose(queue_non_overlap_actions[0].get_action(), incoming[-1].get_action())
+
+
+def test_smooth_timed_actions_preserves_metadata_and_smooths_chunk(robot_client):
+    from lerobot.async_inference.helpers import TimedAction
+    from lerobot.processor import IntraChunkSmoothingProcessorStep
+
+    t = torch.linspace(-1.0, 1.0, 8)
+    alternating = torch.where(torch.arange(t.numel()) % 2 == 0, 1.0, -1.0)
+    action_chunk = torch.stack([t + 0.1 * alternating, -0.5 * t - 0.2 * alternating], dim=-1)
+    timed_actions = [
+        TimedAction(timestamp=100.0 + i, timestep=10 + i, action=action)
+        for i, action in enumerate(action_chunk)
+    ]
+    robot_client._intra_chunk_smoothing_step = IntraChunkSmoothingProcessorStep(enabled=True)
+
+    smoothed_actions = robot_client._smooth_timed_actions(timed_actions)
+
+    expected = robot_client._intra_chunk_smoothing_step.action(action_chunk)
+    for i, (smoothed_action, original_action) in enumerate(zip(smoothed_actions, timed_actions, strict=True)):
+        assert smoothed_action.get_timestamp() == original_action.get_timestamp()
+        assert smoothed_action.get_timestep() == original_action.get_timestep()
+        torch.testing.assert_close(smoothed_action.get_action(), expected[i])
+
+    assert not torch.allclose(torch.stack([action.get_action() for action in smoothed_actions]), action_chunk)
 
 
 @pytest.mark.parametrize(

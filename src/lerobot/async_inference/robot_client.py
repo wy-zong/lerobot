@@ -29,6 +29,7 @@ python src/lerobot/async_inference/robot_client.py \
     --actions_per_chunk=50 \
     --inference_mode=async \
     --chunk_size_threshold=0.5 \
+    --intra_chunk_smoothing=true \
     --aggregate_fn_name=weighted_average \
     --debug_visualize_queue_size=True
 ```
@@ -52,6 +53,7 @@ import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.realsense import RealSenseCameraConfig  # noqa: F401
+from lerobot.processor import IntraChunkSmoothingProcessorStep
 from lerobot.robots import (  # noqa: F401
     Robot,
     RobotConfig,
@@ -171,6 +173,11 @@ class RobotClient:
 
         self.inference_mode = config.inference_mode
         self._chunk_size_threshold = config.chunk_size_threshold
+        self._intra_chunk_smoothing_step = (
+            IntraChunkSmoothingProcessorStep(enabled=True, degree=config.intra_chunk_smoothing_degree)
+            if config.intra_chunk_smoothing
+            else None
+        )
 
         self.action_queue = Queue()
         self.action_queue_lock = threading.Lock()  # Protect queue operations
@@ -404,6 +411,7 @@ class RobotClient:
                 else:
                     self.logger.debug(f"Actions kept on device: {client_device}")
 
+                timed_actions = self._smooth_timed_actions(timed_actions)
                 self.action_chunk_size = max(self.action_chunk_size, len(timed_actions))
 
                 # Calculate network latency if we have matching observations
@@ -466,6 +474,22 @@ class RobotClient:
         """Check if there are actions available in the queue"""
         with self.action_queue_lock:
             return not self.action_queue.empty()
+
+    def _smooth_timed_actions(self, timed_actions: list[TimedAction]) -> list[TimedAction]:
+        """Apply runtime-only intra-chunk smoothing while preserving action timing metadata."""
+        if self._intra_chunk_smoothing_step is None or len(timed_actions) == 0:
+            return timed_actions
+
+        action_chunk = torch.stack([timed_action.get_action() for timed_action in timed_actions], dim=0)
+        smoothed_chunk = self._intra_chunk_smoothing_step.action(action_chunk)
+        return [
+            TimedAction(
+                timestamp=timed_action.get_timestamp(),
+                timestep=timed_action.get_timestep(),
+                action=smoothed_action,
+            )
+            for timed_action, smoothed_action in zip(timed_actions, smoothed_chunk, strict=True)
+        ]
 
     def _reset_remote_policy_state(self) -> None:
         """Discard stale client-side policy actions and force the next observation through."""

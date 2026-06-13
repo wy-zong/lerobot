@@ -163,6 +163,14 @@ class RobotClientConfig:
     )
     chunk_size_threshold: float = field(default=0.5, metadata={"help": "Threshold for chunk size control"})
     fps: int = field(default=DEFAULT_FPS, metadata={"help": "Frames per second"})
+    intra_chunk_smoothing: bool = field(
+        default=False,
+        metadata={"help": "Runtime-only cubic smoothing over each received action chunk before queueing."},
+    )
+    intra_chunk_smoothing_degree: int = field(
+        default=3,
+        metadata={"help": "Polynomial degree for intra-chunk smoothing. Only degree=3 is supported."},
+    )
 
     # Aggregate function configuration (CLI-compatible)
     aggregate_fn_name: str = field(
@@ -225,6 +233,12 @@ class RobotClientConfig:
 
         if self.actions_per_chunk <= 0:
             raise ValueError(f"actions_per_chunk must be positive, got {self.actions_per_chunk}")
+
+        if self.intra_chunk_smoothing_degree != 3:
+            raise ValueError(
+                "Only cubic intra-chunk smoothing is currently supported. "
+                f"Expected --intra_chunk_smoothing_degree=3, got {self.intra_chunk_smoothing_degree}."
+            )
 
         if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:
             raise ValueError("DAgger strategy requires --teleop.type to be set")
@@ -291,6 +305,8 @@ class RobotClientConfig:
             "chunk_size_threshold": self.chunk_size_threshold,
             "fps": self.fps,
             "actions_per_chunk": self.actions_per_chunk,
+            "intra_chunk_smoothing": self.intra_chunk_smoothing,
+            "intra_chunk_smoothing_degree": self.intra_chunk_smoothing_degree,
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,

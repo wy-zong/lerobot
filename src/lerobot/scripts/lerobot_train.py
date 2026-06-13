@@ -315,6 +315,16 @@ def train(
             "the checkpoint processors do not define them. Building processors from current policy config."
         )
         processor_pretrained_path = None
+    if (
+        getattr(active_cfg, "discrete_state_in_language", False)
+        and processor_pretrained_path is not None
+        and not cfg.resume
+    ):
+        logging.warning(
+            "discrete_state_in_language=true with pretrained SmolVLA processors requires the current "
+            "state-prompt preprocessor. Building processors from current policy config."
+        )
+        processor_pretrained_path = None
 
     processor_kwargs = {}
     postprocessor_kwargs = {}

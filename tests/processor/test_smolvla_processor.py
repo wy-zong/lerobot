@@ -24,6 +24,7 @@ from lerobot.configs.types import FeatureType, NormalizationMode, PipelineFeatur
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.processor_smolvla import (
     DropStateProcessorStep,
+    SmolVLADiscreteStatePromptProcessorStep,
     make_smolvla_pre_post_processors,
 )
 from lerobot.processor import (
@@ -90,6 +91,34 @@ def create_default_stats():
     }
 
 
+def create_discrete_state_config():
+    """Create a SmolVLA configuration that encodes state in the language prompt."""
+    config = SmolVLAConfig(discrete_state_in_language=True, device="cpu")
+    config.input_features = {
+        OBS_STATE: PolicyFeature(type=FeatureType.STATE, shape=(3,)),
+        OBS_IMAGE: PolicyFeature(type=FeatureType.VISUAL, shape=(3, 224, 224)),
+    }
+    config.output_features = {
+        ACTION: PolicyFeature(type=FeatureType.ACTION, shape=(3,)),
+    }
+    config.normalization_mapping = {
+        FeatureType.STATE: NormalizationMode.QUANTILES,
+        FeatureType.VISUAL: NormalizationMode.IDENTITY,
+        FeatureType.ACTION: NormalizationMode.IDENTITY,
+    }
+    config.vlm_model_name = "HuggingFaceTB/SmolVLM-Instruct"
+    config.pad_language_to = "max_length"
+    return config
+
+
+def create_discrete_state_stats():
+    return {
+        OBS_STATE: {"q01": torch.zeros(3), "q99": torch.full((3,), 10.0)},
+        OBS_IMAGE: {},
+        ACTION: {"min": torch.full((3,), -1.0), "max": torch.ones(3)},
+    }
+
+
 def test_make_smolvla_processor_basic():
     """Test basic creation of SmolVLA processor."""
     config = create_default_config()
@@ -125,6 +154,87 @@ def test_make_smolvla_processor_basic():
     assert not postprocessor.steps[1].enabled
     assert postprocessor.steps[1].relative_step is preprocessor.steps[5]
     assert isinstance(postprocessor.steps[2], DeviceProcessorStep)
+
+
+def test_make_smolvla_processor_discrete_state_language_order():
+    config = create_discrete_state_config()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(
+            config,
+            create_discrete_state_stats(),
+        )
+
+    assert len(preprocessor.steps) == 9
+    assert isinstance(preprocessor.steps[0], RenameObservationsProcessorStep)
+    assert isinstance(preprocessor.steps[1], AddBatchDimensionProcessorStep)
+    assert isinstance(preprocessor.steps[2], NewLineTaskProcessorStep)
+    assert isinstance(preprocessor.steps[3], DeviceProcessorStep)
+    assert isinstance(preprocessor.steps[4], RelativeActionsProcessorStep)
+    assert isinstance(preprocessor.steps[5], NormalizerProcessorStep)
+    assert isinstance(preprocessor.steps[6], SmolVLADiscreteStatePromptProcessorStep)
+    assert isinstance(preprocessor.steps[8], DropStateProcessorStep)
+    assert isinstance(postprocessor.steps[1], AbsoluteActionsProcessorStep)
+    assert postprocessor.steps[1].relative_step is preprocessor.steps[4]
+
+
+def test_smolvla_discrete_state_prompt_uses_normalized_state_and_drops_state():
+    config = create_discrete_state_config()
+    stats = create_discrete_state_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, _ = make_smolvla_pre_post_processors(config, stats)
+
+    observation = {
+        OBS_STATE: torch.tensor([0.0, 5.0, 10.0]),
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(
+        observation,
+        torch.zeros(3),
+        complementary_data={"task": "pick_cube"},
+    )
+
+    processed = preprocessor(transition_to_batch(transition))
+
+    assert OBS_STATE not in processed
+    assert processed["task"] == ["Task: pick cube, State: 0 128 255;\nAction: "]
+
+
+def test_smolvla_discrete_state_relative_actions_use_raw_state_before_prompt_drop():
+    config = create_discrete_state_config()
+    config.use_relative_actions = True
+    config.relative_exclude_joints = []
+    stats = create_discrete_state_stats()
+
+    with patch(
+        "lerobot.policies.smolvla.processor_smolvla.TokenizerProcessorStep", MockTokenizerProcessorStep
+    ):
+        preprocessor, postprocessor = make_smolvla_pre_post_processors(config, stats)
+
+    state = torch.tensor([0.0, 5.0, 10.0])
+    action = torch.tensor([[1.0, 7.0, 13.0], [2.0, 8.0, 14.0]])
+    observation = {
+        OBS_STATE: state,
+        OBS_IMAGE: torch.randn(3, 224, 224),
+    }
+    transition = create_transition(
+        observation,
+        action,
+        complementary_data={"task": "relative_discrete"},
+    )
+
+    processed = preprocessor(transition_to_batch(transition))
+
+    expected_relative = action - state
+    assert OBS_STATE not in processed
+    torch.testing.assert_close(processed[ACTION], expected_relative)
+    assert processed["task"] == ["Task: relative discrete, State: 0 128 255;\nAction: "]
+    torch.testing.assert_close(postprocessor(processed[ACTION]), action)
 
 
 def test_smolvla_relative_actions_processor_pairing():

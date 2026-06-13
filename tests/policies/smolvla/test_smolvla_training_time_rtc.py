@@ -21,7 +21,7 @@ import torch
 
 from lerobot.configs.default import DatasetConfig
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.configs.types import FeatureType, PolicyFeature
+from lerobot.configs.types import FeatureType, NormalizationMode, PolicyFeature
 from lerobot.policies.smolvla.configuration_smolvla import SmolVLAConfig
 from lerobot.policies.smolvla.modeling_smolvla import SmolVLAPolicy, VLAFlowMatching
 from lerobot.utils.constants import (
@@ -94,6 +94,14 @@ def _make_batch(batch_size: int = 2, chunk_size: int = 10, action_dim: int = 2) 
         OBS_LANGUAGE_ATTENTION_MASK: torch.ones(batch_size, 3, dtype=torch.bool),
         ACTION: torch.ones(batch_size, chunk_size, action_dim),
     }
+
+
+def _get_norm_mode(config: SmolVLAConfig, feature_type: FeatureType) -> NormalizationMode:
+    for key, mode in config.normalization_mapping.items():
+        key_value = key.value if isinstance(key, FeatureType) else key
+        if key_value == feature_type.value:
+            return NormalizationMode(mode)
+    raise AssertionError(f"{feature_type} normalization is missing")
 
 
 def test_smolvla_training_time_rtc_default_disabled_and_forward_contract():
@@ -301,3 +309,39 @@ def test_smolvla_training_time_rtc_policy_cli_overrides_parse():
     assert isinstance(cfg.policy, SmolVLAConfig)
     assert cfg.policy.training_time_rtc_enabled is True
     assert cfg.policy.training_time_rtc_max_delay_steps == 12
+
+
+def test_smolvla_discrete_state_language_config_defaults_and_overrides():
+    default_config = SmolVLAConfig(device="cpu")
+    assert default_config.discrete_state_in_language is False
+    assert default_config.tokenizer_max_length == 48
+    assert _get_norm_mode(default_config, FeatureType.STATE) == NormalizationMode.MEAN_STD
+
+    discrete_config = SmolVLAConfig(device="cpu", discrete_state_in_language=True)
+    assert discrete_config.discrete_state_in_language is True
+    assert discrete_config.tokenizer_max_length == 200
+    assert _get_norm_mode(discrete_config, FeatureType.STATE) == NormalizationMode.QUANTILES
+
+    explicit_length_config = SmolVLAConfig(
+        device="cpu",
+        discrete_state_in_language=True,
+        tokenizer_max_length=128,
+    )
+    assert explicit_length_config.tokenizer_max_length == 128
+
+
+def test_smolvla_discrete_state_language_policy_cli_overrides_parse():
+    cfg = draccus.parse(
+        TrainPipelineConfig,
+        args=[
+            "--dataset.repo_id=lerobot/pusht",
+            "--policy.type=smolvla",
+            "--policy.discrete_state_in_language=true",
+        ],
+    )
+
+    assert isinstance(cfg.dataset, DatasetConfig)
+    assert isinstance(cfg.policy, SmolVLAConfig)
+    assert cfg.policy.discrete_state_in_language is True
+    assert cfg.policy.tokenizer_max_length == 200
+    assert _get_norm_mode(cfg.policy, FeatureType.STATE) == NormalizationMode.QUANTILES

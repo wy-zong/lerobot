@@ -343,7 +343,11 @@ class SmolVLAPolicy(PreTrainedPolicy):
         return actions
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
-        if self.config.adapt_to_pi_aloha and self.config.use_state:
+        if (
+            self.config.adapt_to_pi_aloha
+            and self.config.use_state
+            and not self.config.discrete_state_in_language
+        ):
             batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
 
         return batch
@@ -414,7 +418,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
                 - "none": Return per-sample losses of shape (batch_size,) for RA-BC weighting
         """
         if self.config.adapt_to_pi_aloha:
-            if self.config.use_state:
+            if self.config.use_state and not self.config.discrete_state_in_language:
                 batch[OBS_STATE] = self._pi_aloha_decode_state(batch[OBS_STATE])
             batch[ACTION] = self._pi_aloha_encode_actions_inv(batch[ACTION])
 
@@ -545,7 +549,12 @@ class SmolVLAPolicy(PreTrainedPolicy):
             )
 
         ce_batch = dict(batch)
-        if self.config.adapt_to_pi_aloha and self.config.use_state and OBS_STATE in ce_batch:
+        if (
+            self.config.adapt_to_pi_aloha
+            and self.config.use_state
+            and not self.config.discrete_state_in_language
+            and OBS_STATE in ce_batch
+        ):
             ce_batch[OBS_STATE] = self._pi_aloha_decode_state(ce_batch[OBS_STATE].clone())
 
         images, img_masks = self.prepare_images(ce_batch)
@@ -649,7 +658,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
 
     def prepare_state(self, batch):
         """Pad state"""
-        if not self.config.use_state:
+        if not self.config.use_state or self.config.discrete_state_in_language:
             return None
         if OBS_STATE not in batch:
             raise KeyError(
@@ -668,7 +677,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
     def _get_default_peft_targets(self) -> dict[str, any]:
         """Return default PEFT target modules for SmolVLA fine-tuning."""
         projection_names = ["action_in_proj", "action_out_proj", "action_time_mlp_in", "action_time_mlp_out"]
-        if self.config.use_state:
+        if self.config.use_state and not self.config.discrete_state_in_language:
             projection_names.insert(0, "state_proj")
         common_projections = "|".join(projection_names)
         target_modules = (
@@ -795,7 +804,11 @@ class VLAFlowMatching(nn.Module):
 
     def set_requires_grad(self):
         for params in self.state_proj.parameters():
-            params.requires_grad = self.config.use_state and self.config.train_state_proj
+            params.requires_grad = (
+                self.config.use_state
+                and self.config.train_state_proj
+                and not self.config.discrete_state_in_language
+            )
 
     def sample_noise(self, shape, device):
         noise = torch.normal(
@@ -881,7 +894,7 @@ class VLAFlowMatching(nn.Module):
         att_masks += [0] * num_lang_embs
 
         bsize = lang_emb.shape[0]
-        if self.config.use_state:
+        if self.config.use_state and not self.config.discrete_state_in_language:
             if state is None:
                 raise ValueError("SmolVLA expected state input because `use_state=True`.")
             state_emb = self.state_proj(state)

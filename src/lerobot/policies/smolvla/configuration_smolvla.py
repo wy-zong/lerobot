@@ -42,6 +42,8 @@ class SmolVLAConfig(PreTrainedConfig):
     max_action_dim: int = 32
     # Whether to condition SmolVLA on observation.state.
     use_state: bool = True
+    # Encode normalized observation.state in the language prompt instead of using a continuous state token.
+    discrete_state_in_language: bool = False
     # Optional training-time input dropout. Currently only supports observation.state.
     input_dropout_prob: float = 0.0
     input_dropout_features: list[str] = field(default_factory=list)
@@ -141,6 +143,15 @@ class SmolVLAConfig(PreTrainedConfig):
             )
         if self.image_seq_len is not None and self.image_seq_len <= 0:
             raise ValueError(f"`image_seq_len` must be positive when set. Got {self.image_seq_len}.")
+        if self.discrete_state_in_language:
+            if not self.use_state:
+                raise ValueError(
+                    "`discrete_state_in_language=True` requires `use_state=True` because "
+                    "`observation.state` is needed to build the language prompt."
+                )
+            self._set_state_normalization(NormalizationMode.QUANTILES)
+            if self.tokenizer_max_length == 48:
+                self.tokenizer_max_length = 200
         if not 0.0 <= self.input_dropout_prob <= 1.0:
             raise ValueError(
                 f"`input_dropout_prob` must be in the range [0.0, 1.0]. Got {self.input_dropout_prob}."
@@ -160,6 +171,11 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"`input_dropout_features` includes `{OBS_STATE}`, but `use_state=False`. "
                 "Set `policy.use_state=true` or remove state input dropout."
             )
+        if OBS_STATE in self.input_dropout_features and self.discrete_state_in_language:
+            raise ValueError(
+                f"`input_dropout_features` cannot include `{OBS_STATE}` when "
+                "`discrete_state_in_language=True` because state is encoded in the language prompt."
+            )
         if self.training_time_rtc_max_delay_steps < 0:
             raise ValueError(
                 "`training_time_rtc_max_delay_steps` must be greater than or equal to 0. "
@@ -172,6 +188,14 @@ class SmolVLAConfig(PreTrainedConfig):
                 f"{self.training_time_rtc_max_delay_steps} for `training_time_rtc_max_delay_steps` "
                 f"and {self.chunk_size} for `chunk_size`."
             )
+
+    def _set_state_normalization(self, normalization_mode: NormalizationMode) -> None:
+        for key in list(self.normalization_mapping):
+            key_value = key.value if isinstance(key, FeatureType) else key
+            if key_value == FeatureType.STATE.value:
+                self.normalization_mapping[key] = normalization_mode
+                return
+        self.normalization_mapping[FeatureType.STATE.value] = normalization_mode
 
     def validate_features(self) -> None:
         if not self.input_features:

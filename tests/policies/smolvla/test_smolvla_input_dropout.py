@@ -109,6 +109,16 @@ def test_smolvla_input_dropout_rejects_state_when_state_disabled():
         )
 
 
+def test_smolvla_input_dropout_rejects_state_when_discrete_state_in_language_enabled():
+    with pytest.raises(ValueError, match="discrete_state_in_language=True"):
+        SmolVLAConfig(
+            device="cpu",
+            discrete_state_in_language=True,
+            input_dropout_prob=0.5,
+            input_dropout_features=[OBS_STATE],
+        )
+
+
 def test_smolvla_input_dropout_prob_zero_keeps_state_unchanged():
     policy = _make_policy(input_dropout_prob=0.0, input_dropout_features=[OBS_STATE], training=True)
     batch = _make_batch()

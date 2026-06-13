@@ -213,6 +213,9 @@ class RolloutConfig:
     device: str | None = None
     task: str = ""
     display_data: bool = False
+    # Runtime-only postprocessing for policy action chunks.
+    intra_chunk_smoothing: bool = False
+    intra_chunk_smoothing_degree: int = 3
     # Display data on a remote Rerun server
     display_ip: str | None = None
     # Port of the remote Rerun server
@@ -239,6 +242,12 @@ class RolloutConfig:
 
     def __post_init__(self):
         """Validate config invariants and load the policy config from ``--policy.path``."""
+        if self.intra_chunk_smoothing_degree != 3:
+            raise ValueError(
+                "Only cubic intra-chunk smoothing is currently supported. "
+                f"Expected --intra_chunk_smoothing_degree=3, got {self.intra_chunk_smoothing_degree}."
+            )
+
         # --- Strategy-specific validation ---
         if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:
             raise ValueError("DAgger strategy requires --teleop.type to be set")

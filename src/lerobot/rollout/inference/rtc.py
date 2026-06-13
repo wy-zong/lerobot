@@ -316,8 +316,7 @@ class RTCInferenceEngine(InferenceEngine):
                             preprocessed, inference_delay=delay, prev_chunk_left_over=prev_actions
                         )
 
-                        original = actions.squeeze(0).clone()
-                        processed = self._postprocessor(actions).squeeze(0)
+                        original, processed = self._postprocess_action_chunk(actions)
                         new_latency = time.perf_counter() - current_time
                         new_delay = math.ceil(new_latency / time_per_chunk)
 
@@ -367,4 +366,9 @@ class RTCInferenceEngine(InferenceEngine):
             if self._global_shutdown_event is not None:
                 self._global_shutdown_event.set()
 
+    def _postprocess_action_chunk(self, actions: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return raw RTC chunk for prefixing and processed chunk for execution."""
+        original = actions.squeeze(0).clone()
+        processed = self._postprocessor(actions).squeeze(0)
+        return original, processed
 

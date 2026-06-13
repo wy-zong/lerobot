@@ -437,6 +437,73 @@ def test_sync_non_relative_actions_keep_select_action_path():
     assert policy.predict_action_chunk_calls == 0
 
 
+def test_sync_relative_actions_intra_chunk_smoothing_applies_before_fifo():
+    from lerobot.processor import (
+        AbsoluteActionsProcessorStep,
+        IntraChunkSmoothingProcessorStep,
+        PolicyProcessorPipeline,
+        RelativeActionsProcessorStep,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    t = torch.linspace(-1.0, 1.0, 8)
+    alternating = torch.where(torch.arange(t.numel()) % 2 == 0, 1.0, -1.0)
+    action_chunk = torch.stack([t + 0.1 * alternating, -0.5 * t - 0.2 * alternating], dim=-1).unsqueeze(
+        0
+    )
+    policy = _SyncStubPolicy(action_chunk=action_chunk)
+    relative_step = RelativeActionsProcessorStep(enabled=True)
+    smoothing_step = IntraChunkSmoothingProcessorStep(enabled=True)
+    preprocessor = PolicyProcessorPipeline(steps=[relative_step, _DropObservationStateStep()])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[
+            AbsoluteActionsProcessorStep(enabled=True, relative_step=relative_step),
+            smoothing_step,
+        ],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    actions = [engine.get_action(_make_obs_frame([10.0, 20.0])) for _ in range(action_chunk.shape[1])]
+
+    absolute_chunk = action_chunk + torch.tensor([10.0, 20.0])
+    expected = smoothing_step.action(absolute_chunk).squeeze(0)
+    for action, expected_action in zip(actions, expected, strict=True):
+        torch.testing.assert_close(action, expected_action)
+    assert not torch.allclose(expected, absolute_chunk.squeeze(0))
+    assert policy.predict_action_chunk_calls == 1
+    assert policy.select_action_calls == 0
+
+
+def test_sync_non_relative_select_action_ignores_intra_chunk_smoothing():
+    from lerobot.processor import (
+        IntraChunkSmoothingProcessorStep,
+        PolicyProcessorPipeline,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+
+    policy = _SyncStubPolicy(
+        action_chunk=torch.tensor([[[100.0, 200.0], [300.0, 400.0]]], dtype=torch.float32),
+        select_action=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
+    )
+    preprocessor = PolicyProcessorPipeline(steps=[])
+    postprocessor = PolicyProcessorPipeline(
+        steps=[IntraChunkSmoothingProcessorStep(enabled=True)],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = _make_test_sync_engine(policy, preprocessor, postprocessor)
+
+    action = engine.get_action(_make_obs_frame([10.0, 20.0]))
+
+    torch.testing.assert_close(action, torch.tensor([1.0, 2.0]))
+    assert policy.select_action_calls == 1
+    assert policy.predict_action_chunk_calls == 0
+
+
 def test_sync_relative_actions_reset_clears_fifo_and_cached_state():
     from lerobot.processor import (
         AbsoluteActionsProcessorStep,
@@ -469,6 +536,60 @@ def test_sync_relative_actions_reset_clears_fifo_and_cached_state():
     torch.testing.assert_close(
         engine.get_action(_make_obs_frame([10.0, 20.0])), torch.tensor([10.25, 20.5])
     )
+
+
+def test_rollout_context_appends_runtime_intra_chunk_smoothing_step():
+    from lerobot.processor import IntraChunkSmoothingProcessorStep, PolicyProcessorPipeline
+    from lerobot.rollout.context import _append_intra_chunk_smoothing_step
+
+    cfg = SimpleNamespace(intra_chunk_smoothing=True, intra_chunk_smoothing_degree=3)
+    postprocessor = PolicyProcessorPipeline(steps=[])
+
+    result = _append_intra_chunk_smoothing_step(postprocessor, cfg)
+
+    assert result is postprocessor
+    assert len(postprocessor.steps) == 1
+    assert isinstance(postprocessor.steps[0], IntraChunkSmoothingProcessorStep)
+    assert postprocessor.steps[0].get_config() == {"enabled": True, "degree": 3}
+
+
+def test_rtc_postprocess_action_chunk_smooths_processed_but_keeps_original_raw():
+    from lerobot.policies.rtc.configuration_rtc import RTCConfig
+    from lerobot.processor import (
+        IntraChunkSmoothingProcessorStep,
+        PolicyProcessorPipeline,
+        policy_action_to_transition,
+        transition_to_policy_action,
+    )
+    from lerobot.rollout import RTCInferenceEngine
+
+    t = torch.linspace(-1.0, 1.0, 8)
+    alternating = torch.where(torch.arange(t.numel()) % 2 == 0, 1.0, -1.0)
+    actions = torch.stack([t + 0.1 * alternating, t - 0.15 * alternating], dim=-1).unsqueeze(0)
+    preprocessor = PolicyProcessorPipeline(steps=[])
+    smoothing_step = IntraChunkSmoothingProcessorStep(enabled=True)
+    postprocessor = PolicyProcessorPipeline(
+        steps=[smoothing_step],
+        to_transition=policy_action_to_transition,
+        to_output=transition_to_policy_action,
+    )
+    engine = RTCInferenceEngine(
+        policy=SimpleNamespace(config=SimpleNamespace(action_feature_names=None), reset=lambda: None),
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        robot_wrapper=SimpleNamespace(robot_type="mock_robot", action_features={}),
+        rtc_config=RTCConfig(enabled=True),
+        hw_features={},
+        task="test task",
+        fps=30.0,
+        device="cpu",
+    )
+
+    original, processed = engine._postprocess_action_chunk(actions)
+
+    torch.testing.assert_close(original, actions.squeeze(0))
+    torch.testing.assert_close(processed, smoothing_step.action(actions).squeeze(0))
+    assert not torch.allclose(processed, original)
 
 
 # ---------------------------------------------------------------------------

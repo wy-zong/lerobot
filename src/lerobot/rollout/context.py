@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from threading import Event
+from typing import Any
 
 import torch
 
@@ -36,6 +37,7 @@ from lerobot.datasets import (
 from lerobot.policies import get_policy_class, make_pre_post_processors
 from lerobot.policies.pretrained import PreTrainedPolicy
 from lerobot.processor import (
+    IntraChunkSmoothingProcessorStep,
     PolicyProcessorPipeline,
     RobotAction,
     RobotObservation,
@@ -56,6 +58,24 @@ from .inference import (
 from .robot_wrapper import ThreadSafeRobot
 
 logger = logging.getLogger(__name__)
+
+
+def _append_intra_chunk_smoothing_step(
+    postprocessor: PolicyProcessorPipeline, cfg: RolloutConfig
+) -> PolicyProcessorPipeline:
+    """Append runtime-only intra-chunk smoothing to a loaded policy postprocessor."""
+    if not cfg.intra_chunk_smoothing:
+        return postprocessor
+
+    postprocessor.steps = [
+        *postprocessor.steps,
+        IntraChunkSmoothingProcessorStep(enabled=True, degree=cfg.intra_chunk_smoothing_degree),
+    ]
+    logger.info(
+        "Enabled runtime intra-chunk action smoothing (degree=%d)",
+        cfg.intra_chunk_smoothing_degree,
+    )
+    return postprocessor
 
 
 def _resolve_action_key_order(
@@ -393,6 +413,7 @@ def build_rollout_context(
             "rename_observations_processor": {"rename_map": cfg.rename_map},
         },
     )
+    postprocessor = _append_intra_chunk_smoothing_step(postprocessor, cfg)
 
     # --- 6.5. Optional: SARM subtask predictor ---
     sarm_predictor = None

@@ -61,6 +61,7 @@ from .hil_processor import (
     RewardClassifierProcessorStep,
     TimeLimitProcessorStep,
 )
+from .intra_chunk_smoothing_processor import IntraChunkSmoothingProcessorStep
 from .newline_task_processor import NewLineTaskProcessorStep
 from .normalize_processor import NormalizerProcessorStep, UnnormalizerProcessorStep, hotswap_stats
 from .observation_processor import VanillaObservationProcessorStep
@@ -120,6 +121,7 @@ __all__ = [
     "hotswap_stats",
     "IdentityProcessorStep",
     "ImageCropResizeProcessorStep",
+    "IntraChunkSmoothingProcessorStep",
     "InfoProcessorStep",
     "InterventionActionProcessorStep",
     "make_default_processors",

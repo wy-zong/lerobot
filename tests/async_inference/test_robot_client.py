@@ -530,6 +530,52 @@ def test_remote_dagger_record_autonomous_stops_at_target_episode(monkeypatch):
     assert reset_calls == []
 
 
+def test_robot_client_records_autonomous_wait_frames(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.async_inference.robot_client import RobotClient
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import DAggerStrategyConfig
+    from lerobot.rollout.strategies import DAggerPhase
+    from tests.mocks.mock_robot import MockRobotConfig
+    from tests.mocks.mock_teleop import MockTeleopConfig
+
+    fake_dataset = _FakeDataset()
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+
+    cfg = RobotClientConfig(
+        robot=MockRobotConfig(n_motors=3, random_values=False, static_values=[1, 2, 3]),
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=DAggerStrategyConfig(record_autonomous=True),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_dagger", video=False),
+        teleop=MockTeleopConfig(),
+    )
+    client = RobotClient(cfg)
+
+    try:
+        assert client.dagger_controller is not None
+        client.dagger_controller.events.phase = DAggerPhase.AUTONOMOUS
+        client.dagger_controller.last_action = {
+            "motor_1.pos": 4.0,
+            "motor_2.pos": 5.0,
+            "motor_3.pos": 6.0,
+        }
+
+        observation = client._record_autonomous_wait_frame()
+
+        assert observation == {"motor_1.pos": 1, "motor_2.pos": 2, "motor_3.pos": 3}
+        assert len(fake_dataset.frames) == 1
+        frame = fake_dataset.frames[-1]
+        np.testing.assert_array_equal(frame["observation.state"], np.array([1, 2, 3], dtype=np.float32))
+        np.testing.assert_array_equal(frame["action"], np.array([4, 5, 6], dtype=np.float32))
+        np.testing.assert_array_equal(frame["intervention"], np.array([False], dtype=bool))
+    finally:
+        client.stop()
+
+
 def test_remote_dagger_actuated_handover_and_torque_transitions(monkeypatch):
     import lerobot.async_inference.recording as recording_module
     from lerobot.async_inference.configs import RobotClientConfig
@@ -941,6 +987,7 @@ def test_sync_mode_waits_for_chunk_exhaustion_before_next_observation(monkeypatc
     assert robot_client._ready_to_send_observation() is True
     robot_client.control_loop_observation(task="test task")
     assert len(sent_observations) == 1
+    assert sent_observations[-1].get_timestep() == 0
     assert robot_client.awaiting_action_chunk.is_set() is True
 
     robot_client._aggregate_action_queues(_make_actions(start_ts=time.time(), start_t=0, count=3))
@@ -955,6 +1002,9 @@ def test_sync_mode_waits_for_chunk_exhaustion_before_next_observation(monkeypatc
 
     robot_client.control_loop_action()
     assert robot_client._ready_to_send_observation() is True
+    robot_client.control_loop_observation(task="test task")
+    assert len(sent_observations) == 2
+    assert sent_observations[-1].get_timestep() == 3
 
 
 # -----------------------------------------------------------------------------

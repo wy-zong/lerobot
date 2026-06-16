@@ -86,6 +86,7 @@ from lerobot.transport import (
 )
 from lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from lerobot.utils.import_utils import register_third_party_plugins
+from lerobot.utils.robot_utils import precise_sleep
 from lerobot.utils.visualization_utils import init_rerun, log_rerun_data, shutdown_rerun
 
 from .configs import RobotClientConfig
@@ -511,6 +512,20 @@ class RobotClient:
         elif self.dagger_controller is not None:
             self.dagger_controller.on_policy_action(raw_observation, action)
 
+    def _record_autonomous_wait_frame(self) -> RawObservation | None:
+        if (
+            self.dagger_controller is None
+            or not self.dagger_controller.is_autonomous
+            or not isinstance(self.config.strategy, DAggerStrategyConfig)
+            or not self.config.strategy.record_autonomous
+            or self.dagger_controller.last_action is None
+        ):
+            return None
+
+        raw_observation: RawObservation = self.robot.get_observation()
+        self._record_policy_action(raw_observation, self.dagger_controller.last_action)
+        return raw_observation
+
     def _log_telemetry(self, observation: dict[str, Any] | None, action: dict[str, Any] | None) -> None:
         if not self.config.display_data:
             return
@@ -567,12 +582,20 @@ class RobotClient:
 
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def control_loop_observation(
+        self,
+        task: str,
+        verbose: bool = False,
+        raw_observation: RawObservation | None = None,
+    ) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
+            if raw_observation is None:
+                raw_observation = self.robot.get_observation()
+            else:
+                raw_observation = dict(raw_observation)
             raw_observation["task"] = task
 
             with self.latest_action_lock:
@@ -581,7 +604,7 @@ class RobotClient:
             observation = TimedObservation(
                 timestamp=time.time(),  # need time.time() to compare timestamps across client and server
                 observation=raw_observation,
-                timestep=max(latest_action, 0),
+                timestep=max(latest_action + 1, 0),
             )
 
             obs_capture_time = time.perf_counter() - start_time
@@ -646,11 +669,20 @@ class RobotClient:
                     break
 
                 if self.dagger_controller.is_autonomous:
+                    wait_observation = None
                     if self.actions_available():
                         _performed_action = self.control_loop_action(verbose)
+                    else:
+                        wait_observation = self._record_autonomous_wait_frame()
+                        if wait_observation is not None:
+                            _captured_observation = wait_observation
 
                     if self._ready_to_send_observation():
-                        _captured_observation = self.control_loop_observation(task, verbose)
+                        _captured_observation = self.control_loop_observation(
+                            task,
+                            verbose,
+                            raw_observation=wait_observation,
+                        )
                 else:
                     _captured_observation, _performed_action = self.dagger_controller.hold_or_correct()
             else:
@@ -664,7 +696,7 @@ class RobotClient:
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency
-            time.sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
+            precise_sleep(max(0, self.config.environment_dt - (time.perf_counter() - control_loop_start)))
 
         return _captured_observation, _performed_action
 

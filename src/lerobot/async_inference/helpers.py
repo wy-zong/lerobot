@@ -152,7 +152,7 @@ def prepare_raw_observation(
     lerobot_obs = make_lerobot_observation(robot_obs, lerobot_features)
 
     # 2. Greps all observation.images.<> keys
-    image_keys = list(filter(is_image_key, lerobot_obs))
+    image_keys = [key for key in filter(is_image_key, lerobot_obs) if key in policy_image_features]
     # state's shape is expected as (B, state_dim)
     state_dict = {OBS_STATE: extract_state_from_raw_observation(lerobot_obs)}
     image_dict = {

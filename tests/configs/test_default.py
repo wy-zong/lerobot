@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import draccus
 import pytest
 
 from lerobot.configs.default import DatasetConfig
@@ -36,3 +37,19 @@ def test_dataset_config_none_episodes_ok():
 
 def test_dataset_config_empty_episodes_ok():
     DatasetConfig(repo_id="user/repo", episodes=[])
+
+
+def test_dataset_config_intervention_only_defaults_false():
+    assert DatasetConfig(repo_id="user/repo").intervention_only is False
+
+
+def test_dataset_config_intervention_only_true():
+    assert DatasetConfig(repo_id="user/repo", intervention_only=True).intervention_only is True
+
+
+def test_dataset_config_intervention_only_cli_true():
+    config = draccus.parse(
+        DatasetConfig,
+        args=["--repo_id=user/repo", "--intervention_only=true"],
+    )
+    assert config.intervention_only is True

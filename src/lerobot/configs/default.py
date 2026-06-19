@@ -39,6 +39,9 @@ class DatasetConfig:
     # This reduces memory and speeds up DataLoader IPC. The training pipeline handles the conversion.
     return_uint8: bool = False
     streaming: bool = False
+    # Train only on frames whose ``intervention`` feature is true. This is intended for
+    # expert-only behavior cloning on mixed demonstration / DAgger datasets.
+    intervention_only: bool = False
 
     def __post_init__(self) -> None:
         if self.episodes is not None:

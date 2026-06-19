@@ -137,3 +137,14 @@ def test_partial_episode_drop_warns(caplog):
     # Episode 0 is skipped (1 frame, drop 1), Episode 1 keeps frames 2-5
     assert sampler.indices == [2, 3, 4, 5]
     assert "Episode 0" in caplog.text
+
+
+def test_eligible_indices_intersect_episode_and_frame_drop_filters():
+    sampler = EpisodeAwareSampler(
+        [0, 4],
+        [4, 8],
+        episode_indices_to_use=[1],
+        drop_n_last_frames=1,
+        eligible_indices=[0, 2, 4, 6, 7],
+    )
+    assert sampler.indices == [4, 6]

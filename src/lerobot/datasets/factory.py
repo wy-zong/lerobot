@@ -25,6 +25,7 @@ from lerobot.transforms import ImageTransforms
 from lerobot.utils.constants import ACTION, IMAGENET_STATS, OBS_PREFIX, REWARD
 
 from .dataset_metadata import LeRobotDatasetMetadata
+from .intervention import validate_intervention_only_config
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
 from .streaming_dataset import StreamingLeRobotDataset
@@ -85,6 +86,8 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
         ds_meta = LeRobotDatasetMetadata(
             cfg.dataset.repo_id, root=cfg.dataset.root, revision=cfg.dataset.revision
         )
+        if cfg.dataset.intervention_only:
+            validate_intervention_only_config(ds_meta, cfg.trainable_config)
         delta_timestamps = resolve_delta_timestamps(cfg.trainable_config, ds_meta)
         skip_video_decode = bool(getattr(cfg.trainable_config, "precomputed_image_features_path", None))
         if skip_video_decode and cfg.dataset.streaming:
@@ -115,6 +118,7 @@ def make_dataset(cfg: TrainPipelineConfig) -> LeRobotDataset | MultiLeRobotDatas
                 max_num_shards=cfg.num_workers,
                 tolerance_s=cfg.tolerance_s,
                 return_uint8=True,
+                intervention_only=cfg.dataset.intervention_only,
             )
     else:
         raise NotImplementedError("The MultiLeRobotDataset isn't supported for now.")

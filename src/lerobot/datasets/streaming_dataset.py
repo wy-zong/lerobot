@@ -252,6 +252,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         rng: np.random.Generator | None = None,
         shuffle: bool = True,
         return_uint8: bool = False,
+        intervention_only: bool = False,
     ):
         """Initialize a StreamingLeRobotDataset.
 
@@ -272,6 +273,8 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             seed (int, optional): Reproducibility random seed.
             rng (np.random.Generator | None, optional): Random number generator.
             shuffle (bool, optional): Whether to shuffle the dataset across exhaustions. Defaults to True.
+            intervention_only (bool, optional): Skip raw rows whose ``intervention`` value is false
+                before delta windows, video decoding, transforms, or shuffle buffering.
         """
         super().__init__()
         self.repo_id = repo_id
@@ -286,6 +289,7 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
         self.seed = seed
         self.rng = rng if rng is not None else np.random.default_rng(seed)
         self.shuffle = shuffle
+        self.intervention_only = intervention_only
 
         self.streaming = streaming
         self.buffer_size = buffer_size
@@ -321,6 +325,9 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
             data_files="data/*/*.parquet",
             revision=self.revision,
         )
+        if self.episodes is not None:
+            selected_episodes = set(self.episodes)
+            self.hf_dataset = self.hf_dataset.filter(lambda row: row["episode_index"] in selected_episodes)
 
         self.num_shards = min(self.hf_dataset.num_shards, max_num_shards)
 
@@ -466,6 +473,10 @@ class StreamingLeRobotDataset(torch.utils.data.IterableDataset):
     def make_frame(self, dataset_iterator: Backtrackable) -> Generator:
         """Makes a frame starting from a dataset iterator"""
         item = next(dataset_iterator)
+        if self.intervention_only:
+            intervention = np.asarray(item["intervention"])
+            if intervention.size != 1 or not bool(intervention.reshape(-1)[0]):
+                return
         item = item_to_torch(item)
 
         updates = []  # list of "updates" to apply to the item retrieved from hf_dataset (w/o camera features)

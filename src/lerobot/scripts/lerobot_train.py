@@ -44,7 +44,13 @@ from lerobot.common.train_utils import (
 from lerobot.common.wandb_utils import WandBLogger
 from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
-from lerobot.datasets import EpisodeAwareSampler, make_dataset
+from lerobot.datasets import (
+    EpisodeAwareSampler,
+    apply_intervention_only_data,
+    compute_intervention_only_data,
+    make_dataset,
+    selected_episode_boundaries,
+)
 from lerobot.envs import close_envs, make_env, make_env_pre_post_processors
 from lerobot.optim.factory import make_optimizer_and_scheduler
 from lerobot.policies import PreTrainedPolicy, make_policy, make_pre_post_processors
@@ -242,6 +248,7 @@ def train(
     if is_main_process:
         logging.info("Creating dataset")
         dataset = make_dataset(cfg)
+        intervention_data = compute_intervention_only_data(dataset) if cfg.dataset.intervention_only else None
         if dataset_validator is not None:
             dataset_validator(dataset, cfg)
 
@@ -250,8 +257,18 @@ def train(
     # Now all other processes can safely load the dataset
     if not is_main_process:
         dataset = make_dataset(cfg)
+        intervention_data = None
         if dataset_validator is not None:
             dataset_validator(dataset, cfg)
+
+    if cfg.dataset.intervention_only:
+        # The projected parquet scan and true-only statistics are computed once. Broadcast both the
+        # runtime stats and eligible row indices so every rank uses identical normalization/sampling.
+        from accelerate.utils import broadcast_object_list
+
+        payload = broadcast_object_list([intervention_data], from_process=0)
+        intervention_data = payload[0]
+        apply_intervention_only_data(dataset, intervention_data)
 
     # Create environment used for evaluating checkpoints during training on simulation data.
     # On real-world data, no need to create an environment as evaluations are done outside train.py,
@@ -405,6 +422,23 @@ def train(
         logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
         logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
         logging.info(f"{dataset.num_episodes=}")
+        if cfg.dataset.intervention_only:
+            intervention_ratio = dataset.intervention_true_frames / dataset.intervention_total_frames
+            logging.info(
+                "Intervention-only dataset: %d/%d frames (%.2f%%) have intervention=true",
+                dataset.intervention_true_frames,
+                dataset.intervention_total_frames,
+                intervention_ratio * 100,
+            )
+            for feature_key in ("observation.state", "action"):
+                feature_stats = dataset.meta.stats[feature_key]
+                logging.info(
+                    "True-only %s stats: mean=%s std=%s",
+                    feature_key,
+                    feature_stats["mean"],
+                    feature_stats["std"],
+                )
+            logging.info("Streaming intervention filter enabled: %s", cfg.dataset.streaming)
         num_processes = accelerator.num_processes
         effective_bs = cfg.batch_size * num_processes
         logging.info(f"Effective batch size: {cfg.batch_size} x {num_processes} = {effective_bs}")
@@ -412,7 +446,17 @@ def train(
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if hasattr(active_cfg, "drop_n_last_frames"):
+    if cfg.dataset.intervention_only and not cfg.dataset.streaming:
+        dataset_from_indices, dataset_to_indices = selected_episode_boundaries(dataset)
+        sampler = EpisodeAwareSampler(
+            dataset_from_indices,
+            dataset_to_indices,
+            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+            shuffle=True,
+            eligible_indices=dataset.intervention_indices,
+        )
+        shuffle = False
+    elif hasattr(active_cfg, "drop_n_last_frames") and not cfg.dataset.streaming:
         shuffle = False
         sampler = EpisodeAwareSampler(
             dataset.meta.episodes["dataset_from_index"],
@@ -424,6 +468,10 @@ def train(
     else:
         shuffle = True
         sampler = None
+
+    if is_main_process and cfg.dataset.intervention_only:
+        effective_samples = len(sampler) if sampler is not None else dataset.intervention_true_frames
+        logging.info("Effective intervention-only training samples: %d", effective_samples)
 
     dataloader = torch.utils.data.DataLoader(
         dataset,

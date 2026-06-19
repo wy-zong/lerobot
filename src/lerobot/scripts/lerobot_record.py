@@ -91,6 +91,8 @@ import time
 from dataclasses import asdict, dataclass
 from pprint import pformat
 
+import numpy as np
+
 from lerobot.cameras import CameraConfig  # noqa: F401
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
 from lerobot.cameras.reachy2_camera import Reachy2CameraConfig  # noqa: F401
@@ -322,6 +324,9 @@ def record_loop(
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
+            if "intervention" in dataset.features:
+                # Teleoperated demonstrations are expert data by definition.
+                frame["intervention"] = np.array([True], dtype=bool)
             dataset.add_frame(frame)
 
         if display_data:
@@ -407,6 +412,10 @@ def record(
                 if num_cameras > 0
                 else 0,
             )
+            if "intervention" in dataset.features:
+                # Newer demonstration datasets carry this feature; legacy datasets remain resumable
+                # without changing their schema.
+                dataset_features["intervention"] = dataset.features["intervention"]
             sanity_check_dataset_robot_compatibility(dataset, robot, cfg.dataset.fps, dataset_features)
         else:
             # Reject eval_ prefix — for policy evaluation use lerobot-rollout
@@ -417,6 +426,11 @@ def record(
                     "lerobot-record is for data collection only. Use lerobot-rollout for policy deployment."
                 )
             cfg.dataset.stamp_repo_id()
+            dataset_features["intervention"] = {
+                "dtype": "bool",
+                "shape": (1,),
+                "names": None,
+            }
             dataset = LeRobotDataset.create(
                 cfg.dataset.repo_id,
                 cfg.dataset.fps,

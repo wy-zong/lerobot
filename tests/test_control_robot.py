@@ -73,6 +73,7 @@ def test_record_and_resume(tmp_path):
     assert dataset.meta.total_episodes == dataset.num_episodes == 1
     assert dataset.meta.total_frames == dataset.num_frames == 3
     assert dataset.meta.total_tasks == 1
+    assert dataset.hf_dataset.with_format(None)["intervention"] == [True, True, True]
 
     cfg.resume = True
     # Mock the revision to prevent Hub calls during resume

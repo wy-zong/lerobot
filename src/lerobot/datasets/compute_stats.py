@@ -59,6 +59,10 @@ class RunningQuantileStats:
             batch: An array where all dimensions except the last are batch dimensions.
         """
         batch = batch.reshape(-1, batch.shape[-1])
+        # NumPy histogram warns while implicitly converting boolean arrays. Boolean metadata
+        # features (for example ``intervention``) have well-defined numeric 0/1 statistics.
+        if np.issubdtype(batch.dtype, np.bool_):
+            batch = batch.astype(np.uint8)
         num_elements, vector_length = batch.shape
 
         if self._count == 0:

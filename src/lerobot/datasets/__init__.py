@@ -36,6 +36,11 @@ from .dataset_tools import (
 )
 from .factory import make_dataset, resolve_delta_timestamps
 from .image_writer import safe_stop_image_writer
+from .intervention import (
+    apply_intervention_only_data,
+    compute_intervention_only_data,
+    selected_episode_boundaries,
+)
 from .io_utils import load_episodes, write_stats
 from .lerobot_dataset import LeRobotDataset
 from .multi_dataset import MultiLeRobotDataset
@@ -65,11 +70,13 @@ __all__ = [
     "add_features",
     "aggregate_datasets",
     "aggregate_pipeline_dataset_features",
+    "apply_intervention_only_data",
     "aggregate_stats",
     "convert_image_to_video_dataset",
     "create_initial_features",
     "create_lerobot_dataset_card",
     "delete_episodes",
+    "compute_intervention_only_data",
     "get_feature_stats",
     "load_episodes",
     "make_dataset",
@@ -80,6 +87,7 @@ __all__ = [
     "remove_feature",
     "resolve_delta_timestamps",
     "safe_stop_image_writer",
+    "selected_episode_boundaries",
     "split_dataset",
     "write_stats",
 ]

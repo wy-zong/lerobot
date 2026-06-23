@@ -827,7 +827,13 @@ class VLAFlowMatching(nn.Module):
         return time
 
     def embed_prefix(
-        self, images, img_masks, lang_tokens, lang_masks, state: torch.Tensor | None = None
+        self,
+        images,
+        img_masks,
+        lang_tokens,
+        lang_masks,
+        state: torch.Tensor | None = None,
+        trace: dict | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for SmolVLM transformer processing.
@@ -835,10 +841,14 @@ class VLAFlowMatching(nn.Module):
         embs = []
         pad_masks = []
         att_masks = []
+        token_groups: dict[str, list[list[int]]] = {}
+        token_offset = 0
+        image_group_names = trace.get("image_group_names", []) if trace is not None else []
         for _img_idx, (
             img,
             img_mask,
         ) in enumerate(zip(images, img_masks, strict=False)):
+            image_start_offset = token_offset
             if self.add_image_special_tokens:
                 image_start_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -853,6 +863,7 @@ class VLAFlowMatching(nn.Module):
                 att_masks += [0] * (image_start_mask.shape[-1])
                 embs.append(image_start_token)
                 pad_masks.append(image_start_mask)
+                token_offset += image_start_mask.shape[-1]
 
             img_emb = self.vlm_with_expert.embed_image(img)
             img_emb = img_emb
@@ -868,6 +879,7 @@ class VLAFlowMatching(nn.Module):
             pad_masks.append(img_mask)
 
             att_masks += [0] * (num_img_embs)
+            token_offset += num_img_embs
             if self.add_image_special_tokens:
                 image_end_token = (
                     self.vlm_with_expert.embed_language_tokens(
@@ -882,6 +894,11 @@ class VLAFlowMatching(nn.Module):
                 embs.append(image_end_token)
                 pad_masks.append(image_end_mask)
                 att_masks += [0] * (image_end_mask.shape[1])
+                token_offset += image_end_mask.shape[1]
+            image_group_name = (
+                image_group_names[_img_idx] if _img_idx < len(image_group_names) else f"image_{_img_idx}"
+            )
+            token_groups[image_group_name] = [[image_start_offset, token_offset]]
         lang_emb = self.vlm_with_expert.embed_language_tokens(lang_tokens)
         # Normalize language embeddings
         lang_emb_dim = lang_emb.shape[-1]
@@ -892,6 +909,22 @@ class VLAFlowMatching(nn.Module):
 
         num_lang_embs = lang_emb.shape[1]
         att_masks += [0] * num_lang_embs
+        language_start_offset = token_offset
+        language_token_groups = trace.get("language_token_groups") if trace is not None else None
+        if language_token_groups is None:
+            token_groups["language"] = [[language_start_offset, language_start_offset + num_lang_embs]]
+        else:
+            for group_name, relative_ranges in language_token_groups.items():
+                if len(relative_ranges) == 2 and all(isinstance(value, int) for value in relative_ranges):
+                    relative_ranges = [relative_ranges]
+                absolute_ranges = []
+                for start, end in relative_ranges:
+                    start = max(0, min(int(start), num_lang_embs))
+                    end = max(0, min(int(end), num_lang_embs))
+                    if start < end:
+                        absolute_ranges.append([language_start_offset + start, language_start_offset + end])
+                token_groups.setdefault(group_name, []).extend(absolute_ranges)
+        token_offset += num_lang_embs
 
         bsize = lang_emb.shape[0]
         if self.config.use_state and not self.config.discrete_state_in_language:
@@ -909,6 +942,8 @@ class VLAFlowMatching(nn.Module):
 
             # Set attention masks so that image and language inputs do not attend to state or actions
             att_masks += [1] * (states_seq_len)
+            token_groups.setdefault("state", []).append([token_offset, token_offset + states_seq_len])
+            token_offset += states_seq_len
         embs = torch.cat(embs, dim=1)
         pad_masks = torch.cat(pad_masks, dim=1)
         att_masks = torch.tensor(att_masks, dtype=torch.bool, device=pad_masks.device)
@@ -921,6 +956,11 @@ class VLAFlowMatching(nn.Module):
             att_masks = pad_tensor(att_masks, self.prefix_length, pad_value=0)
 
         att_masks = att_masks.expand(bsize, -1)
+
+        if trace is not None:
+            trace["token_groups"] = token_groups
+            trace["prefix_length"] = int(pad_masks.shape[1])
+            trace["valid_prefix_tokens"] = [int(value) for value in pad_masks.sum(dim=-1).tolist()]
 
         return embs, pad_masks, att_masks
 
@@ -1139,6 +1179,7 @@ class VLAFlowMatching(nn.Module):
         lang_masks,
         state: Tensor | None,
         noise=None,
+        trace: dict | None = None,
         **kwargs: Unpack[ActionSelectKwargs],
     ) -> Tensor:
         """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
@@ -1154,7 +1195,7 @@ class VLAFlowMatching(nn.Module):
             noise = self.sample_noise(actions_shape, device)
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks, state=state
+            images, img_masks, lang_tokens, lang_masks, state=state, trace=trace
         )
         prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
@@ -1172,6 +1213,8 @@ class VLAFlowMatching(nn.Module):
 
         x_t = noise
         for step in range(num_steps):
+            if trace is not None:
+                trace["_denoise_step"] = step
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=torch.float32, device=device).expand(bsize)
 
@@ -1181,6 +1224,7 @@ class VLAFlowMatching(nn.Module):
                     prefix_pad_masks=prefix_pad_masks,
                     past_key_values=past_key_values,
                     timestep=current_timestep,
+                    trace=trace,
                 )
 
             if self._rtc_enabled():
@@ -1204,6 +1248,8 @@ class VLAFlowMatching(nn.Module):
             if self.rtc_processor is not None and self.rtc_processor.is_debug_enabled():
                 self.rtc_processor.track(time=time, x_t=x_t, v_t=v_t)
 
+        if trace is not None:
+            trace.pop("_denoise_step", None)
         return x_t
 
     def denoise_step(

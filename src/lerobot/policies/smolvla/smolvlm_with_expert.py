@@ -136,13 +136,21 @@ def _record_attention_for_trace(
 
     probs_float = probs.detach().to(dtype=torch.float32)
     group_mass = {}
-    for group_name, bounds in trace.get("token_groups", {}).items():
-        start, end = int(bounds[0]), int(bounds[1])
-        start = max(start, 0)
-        end = min(end, key_length)
-        if start >= end:
-            continue
-        group_mass[group_name] = float(probs_float[..., start:end].sum(dim=-1).mean().item())
+    for group_name, group_ranges in trace.get("token_groups", {}).items():
+        # A semantic group can be non-contiguous. For example, a discrete state
+        # span can sit between task and action language tokens in one prompt.
+        if len(group_ranges) == 2 and all(isinstance(value, int) for value in group_ranges):
+            group_ranges = [group_ranges]
+
+        mass = 0.0
+        for bounds in group_ranges:
+            start, end = int(bounds[0]), int(bounds[1])
+            start = max(start, 0)
+            end = min(end, key_length)
+            if start >= end:
+                continue
+            mass += float(probs_float[..., start:end].sum(dim=-1).mean().item())
+        group_mass[group_name] = mass
 
     total_group_mass = sum(group_mass.values())
     attention_entry = {
@@ -153,6 +161,8 @@ def _record_attention_for_trace(
         "total_group_mass": float(total_group_mass),
         "ungrouped_mass": float(max(0.0, 1.0 - total_group_mass)),
     }
+    if "_denoise_step" in trace:
+        attention_entry["denoise_step"] = int(trace["_denoise_step"])
     trace.setdefault("attention", []).append(attention_entry)
 
 

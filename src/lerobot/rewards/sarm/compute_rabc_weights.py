@@ -33,6 +33,7 @@ Usage:
     python src/lerobot/rewards/sarm/compute_rabc_weights.py \\
         --dataset-repo-id lerobot/aloha_sim_insertion_human \\
         --reward-model-path <USER>/sarm_single_uni4 \\
+        --batch-size 16 \\
         --stride 5
 
     # Visualize predictions only (no RA-BC computation)
@@ -58,7 +59,6 @@ import torch
 from tqdm import tqdm
 
 from lerobot.datasets import LeRobotDataset
-
 from lerobot.rewards.sarm.modeling_sarm import SARMRewardModel
 from lerobot.rewards.sarm.processor_sarm import make_sarm_pre_post_processors
 from lerobot.rewards.sarm.sarm_utils import normalize_stage_tau
@@ -82,6 +82,7 @@ def load_sarm_resources(
     reward_model_path: str,
     device: str = "cuda",
     image_key_override: str | None = None,
+    precomputed_image_features_path: str | None = None,
 ) -> tuple[LeRobotDataset, SARMRewardModel, any]:
     """
     Load SARM model, dataset, and preprocessor.
@@ -98,19 +99,35 @@ def load_sarm_resources(
         logging.info(f"Overriding image_key from {reward_model.config.image_key} to {image_key_override}")
         reward_model.config.image_key = image_key_override
 
+    if precomputed_image_features_path:
+        logging.info(f"Using precomputed image features: {precomputed_image_features_path}")
+        reward_model.config.precomputed_image_features_path = precomputed_image_features_path
+
     image_key = reward_model.config.image_key
     state_key = reward_model.config.state_key
     delta_indices = reward_model.config.observation_delta_indices
+    use_precomputed_images = reward_model.config.precomputed_image_features_path is not None
 
     logging.info(f"Loading dataset: {dataset_repo_id}")
-    temp_dataset = LeRobotDataset(dataset_repo_id, download_videos=True)
+    temp_dataset = LeRobotDataset(
+        dataset_repo_id,
+        download_videos=not use_precomputed_images,
+        skip_video_decode=use_precomputed_images,
+    )
     fps = temp_dataset.fps
 
     delta_timestamps = {
-        image_key: [idx / fps for idx in delta_indices],
         state_key: [idx / fps for idx in delta_indices],
     }
-    dataset = LeRobotDataset(dataset_repo_id, delta_timestamps=delta_timestamps)
+    if not use_precomputed_images:
+        delta_timestamps[image_key] = [idx / fps for idx in delta_indices]
+
+    dataset = LeRobotDataset(
+        dataset_repo_id,
+        delta_timestamps=delta_timestamps,
+        download_videos=not use_precomputed_images,
+        skip_video_decode=use_precomputed_images,
+    )
     logging.info(f"Dataset: {dataset.num_episodes} episodes, {dataset.num_frames} frames")
 
     preprocess, _ = make_sarm_pre_post_processors(
@@ -193,7 +210,7 @@ def visualize_episode(
     for i in range(num_sample):
         frame = frames[i]
         real_idx = display_indices[i] if display_indices is not None else int(i * (len(progress_preds) - 1) / max(1, num_sample - 1))
-        
+
         if frame.shape[-1] == 1:
             frame = np.repeat(frame, 3, axis=-1)
         combined[:, i * w : (i + 1) * w] = frame
@@ -471,6 +488,108 @@ def interpolate_progress(
     return out.astype(np.float32)
 
 
+def iter_chunks(items: list[int], chunk_size: int):
+    """Yield fixed-size chunks from a list."""
+    for start in range(0, len(items), chunk_size):
+        yield items[start : start + chunk_size]
+
+
+def _stack_sample_values(values: list):
+    """Stack per-frame dataset values into a batch while preserving tensor/array type."""
+    first = values[0]
+    if isinstance(first, torch.Tensor):
+        return torch.stack(values, dim=0)
+    if isinstance(first, np.ndarray):
+        return np.stack(values, axis=0)
+    return values
+
+
+def build_sarm_batch(
+    dataset: LeRobotDataset,
+    query_indices: list[int],
+    image_key: str,
+    state_key: str,
+    task: str,
+    episode_idx: int,
+    include_image: bool = True,
+) -> dict:
+    """Load dataset samples and collate them into a SARM preprocessing batch."""
+    samples = [dataset[idx] for idx in query_indices]
+    batch = {
+        "task": task,
+        "index": torch.tensor(query_indices, dtype=torch.long),
+        "episode_index": torch.full((len(query_indices),), episode_idx, dtype=torch.long),
+    }
+    if include_image:
+        batch[image_key] = _stack_sample_values([sample[image_key] for sample in samples])
+    if state_key in samples[0]:
+        batch[state_key] = _stack_sample_values([sample[state_key] for sample in samples])
+    return batch
+
+
+def infer_sarm_progress_batch(
+    batch: dict,
+    query_indices: list[int],
+    reward_model: SARMRewardModel,
+    preprocess,
+    device: str,
+    center_idx: int,
+    compute_sparse: bool,
+    compute_dense: bool,
+) -> dict[int, tuple[float, float]]:
+    """Run SARM progress inference for a batch of query frames."""
+    with torch.no_grad():
+        processed = preprocess(batch)
+        video_features = processed["video_features"].to(device)
+        text_features = processed["text_features"].to(device)
+        state_features = processed.get("state_features")
+        if state_features is not None:
+            state_features = state_features.to(device)
+        lengths = processed.get("lengths")
+
+        sparse_vals = np.full(len(query_indices), np.nan, dtype=np.float32)
+        dense_vals = np.full(len(query_indices), np.nan, dtype=np.float32)
+
+        if compute_sparse:
+            sparse_progress = reward_model.calculate_rewards(
+                text_embeddings=text_features,
+                video_embeddings=video_features,
+                state_features=state_features,
+                lengths=lengths,
+                return_all_frames=True,
+                head_mode="sparse",
+            )
+            sparse_progress = np.asarray(sparse_progress)
+            if sparse_progress.ndim == 1:
+                sparse_vals[0] = sparse_progress[center_idx]
+            else:
+                sparse_vals = sparse_progress[:, center_idx].astype(np.float32)
+
+        if compute_dense:
+            dense_progress = reward_model.calculate_rewards(
+                text_embeddings=text_features,
+                video_embeddings=video_features,
+                state_features=state_features,
+                lengths=lengths,
+                return_all_frames=True,
+                head_mode="dense",
+            )
+            dense_progress = np.asarray(dense_progress)
+            if dense_progress.ndim == 1:
+                dense_vals[0] = dense_progress[center_idx]
+            else:
+                dense_vals = dense_progress[:, center_idx].astype(np.float32)
+
+        del processed, video_features, text_features
+        if state_features is not None:
+            del state_features
+
+    return {
+        query_idx: (float(sparse_vals[i]), float(dense_vals[i]))
+        for i, query_idx in enumerate(query_indices)
+    }
+
+
 def compute_sarm_progress(
     dataset_repo_id: str,
     reward_model_path: str,
@@ -481,6 +600,8 @@ def compute_sarm_progress(
     output_dir: str = "./sarm_viz",
     stride: int = 1,
     image_key_override: str | None = None,
+    batch_size: int = 1,
+    precomputed_image_features_path: str | None = None,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -495,8 +616,19 @@ def compute_sarm_progress(
         output_dir: Directory to save visualizations
         stride: Compute progress every N frames, interpolate the rest (default: 1 = every frame)
         image_key_override: Override the image key from the model config
+        batch_size: Number of query frames to process per model/preprocessor call
+        precomputed_image_features_path: Path to precomputed CLIP image features memmap
     """
-    dataset, reward_model, preprocess = load_sarm_resources(dataset_repo_id, reward_model_path, device, image_key_override)
+    if batch_size < 1:
+        raise ValueError(f"batch_size must be >= 1, got {batch_size}")
+
+    dataset, reward_model, preprocess = load_sarm_resources(
+        dataset_repo_id,
+        reward_model_path,
+        device,
+        image_key_override,
+        precomputed_image_features_path,
+    )
 
     # Set preprocessor to eval mode to disable augmentations
     if hasattr(preprocess, "eval"):
@@ -508,6 +640,13 @@ def compute_sarm_progress(
     image_key = reward_model.config.image_key
     state_key = reward_model.config.state_key
     frame_gap = reward_model.config.frame_gap
+    include_image = reward_model.config.precomputed_image_features_path is None
+    if not include_image and num_visualizations > 0:
+        logging.warning(
+            "Skipping visualizations because precomputed image features are enabled and images are not loaded. "
+            "Run visualization separately without --precomputed-image-features-path if needed."
+        )
+        num_visualizations = 0
     num_episodes = dataset.num_episodes
     total_frames = dataset.num_frames
     logging.info(f"Processing {total_frames} frames across {num_episodes} episodes")
@@ -554,67 +693,55 @@ def compute_sarm_progress(
         # Dictionary to collect results
         frame_results = {}
 
-        for query_idx in tqdm(compute_indices, desc=f"  Ep {episode_idx}", leave=False):
+        for query_batch in tqdm(
+            list(iter_chunks(compute_indices, batch_size)),
+            desc=f"  Ep {episode_idx}",
+            leave=False,
+        ):
             try:
-                sample = dataset[query_idx]
-
-                batch = {
-                    image_key: sample[image_key],
-                    "task": task,
-                    "index": query_idx,
-                    "episode_index": episode_idx,
-                }
-                if state_key in sample:
-                    batch[state_key] = sample[state_key]
-
-                with torch.no_grad():
-                    processed = preprocess(batch)
-                    video_features = processed["video_features"].to(device)
-                    text_features = processed["text_features"].to(device)
-                    state_features = processed.get("state_features")
-                    if state_features is not None:
-                        state_features = state_features.to(device)
-                    lengths = processed.get("lengths")
-
-                    sparse_val = np.nan
-                    dense_val = np.nan
-
-                    # Compute sparse prediction for center frame
-                    if compute_sparse:
-                        sparse_progress = reward_model.calculate_rewards(
-                            text_embeddings=text_features,
-                            video_embeddings=video_features,
-                            state_features=state_features,
-                            lengths=lengths,
-                            return_all_frames=True,
-                            head_mode="sparse",
-                        )
-                        sparse_val = float(
-                            sparse_progress[0, center_idx]
-                            if sparse_progress.ndim == 2
-                            else sparse_progress[center_idx]
-                        )
-
-                    # Compute dense prediction for center frame
-                    if compute_dense:
-                        dense_progress = reward_model.calculate_rewards(
-                            text_embeddings=text_features,
-                            video_embeddings=video_features,
-                            state_features=state_features,
-                            lengths=lengths,
-                            return_all_frames=True,
-                            head_mode="dense",
-                        )
-                        dense_val = float(
-                            dense_progress[0, center_idx]
-                            if dense_progress.ndim == 2
-                            else dense_progress[center_idx]
-                        )
-
-                    frame_results[query_idx] = (sparse_val, dense_val)
-
+                batch = build_sarm_batch(
+                    dataset, query_batch, image_key, state_key, task, episode_idx, include_image
+                )
+                frame_results.update(
+                    infer_sarm_progress_batch(
+                        batch,
+                        query_batch,
+                        reward_model,
+                        preprocess,
+                        device,
+                        center_idx,
+                        compute_sparse,
+                        compute_dense,
+                    )
+                )
             except Exception as e:
-                logging.warning(f"Failed to process frame {query_idx}: {e}")
+                if len(query_batch) == 1:
+                    logging.warning(f"Failed to process frame {query_batch[0]}: {e}")
+                    continue
+
+                logging.warning(
+                    f"Failed to process batch {query_batch[0]}-{query_batch[-1]} "
+                    f"(size={len(query_batch)}), retrying one frame at a time: {e}"
+                )
+                for query_idx in query_batch:
+                    try:
+                        batch = build_sarm_batch(
+                            dataset, [query_idx], image_key, state_key, task, episode_idx, include_image
+                        )
+                        frame_results.update(
+                            infer_sarm_progress_batch(
+                                batch,
+                                [query_idx],
+                                reward_model,
+                                preprocess,
+                                device,
+                                center_idx,
+                                compute_sparse,
+                                compute_dense,
+                            )
+                        )
+                    except Exception as frame_error:
+                        logging.warning(f"Failed to process frame {query_idx}: {frame_error}")
 
         # Interpolate to get values for all frames
         computed_indices = np.array(sorted(frame_results.keys()))
@@ -788,8 +915,8 @@ Examples:
     )
     parser.add_argument(
         "--push-to-hub",
-        action="store_true",
-        help="Upload progress file to the dataset repo on HuggingFace Hub",
+        action=argparse.BooleanOptionalAction,
+        help="Upload progress file to the dataset repo on HuggingFace Hub (use --no-push-to-hub to skip)",
         default=True,
     )
     parser.add_argument(
@@ -799,10 +926,22 @@ Examples:
         help="Compute progress every N frames, interpolate the rest (default: 1 = every frame)",
     )
     parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of query frames to process per inference batch (default: 1)",
+    )
+    parser.add_argument(
         "--image-key",
         type=str,
         default=None,
         help="Override the image key from the model config (useful if dataset uses a different camera name)",
+    )
+    parser.add_argument(
+        "--precomputed-image-features-path",
+        type=str,
+        default=None,
+        help="Path to .npy CLIP image features from lerobot-sarm-precompute-clip",
     )
 
     args = parser.parse_args()
@@ -826,7 +965,11 @@ Examples:
     # Handle visualize-only mode
     if args.visualize_only:
         dataset, reward_model, preprocess = load_sarm_resources(
-            args.dataset_repo_id, reward_model_path, args.device, args.image_key
+            args.dataset_repo_id,
+            reward_model_path,
+            args.device,
+            args.image_key,
+            args.precomputed_image_features_path,
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
         viz_episodes = list(range(min(args.num_visualizations, dataset.num_episodes)))
@@ -853,6 +996,8 @@ Examples:
         output_dir=args.output_dir,
         stride=args.stride,
         image_key_override=args.image_key,
+        batch_size=args.batch_size,
+        precomputed_image_features_path=args.precomputed_image_features_path,
     )
 
     print(f"\nSARM progress values saved to: {output_path}")

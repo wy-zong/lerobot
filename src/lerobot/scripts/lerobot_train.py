@@ -20,9 +20,11 @@ Requires: pip install 'lerobot[training]'  (includes dataset + accelerate + wand
 
 import dataclasses
 import logging
+import math
 import time
 from collections.abc import Callable
 from contextlib import nullcontext
+from copy import deepcopy
 from pprint import pformat
 from typing import TYPE_CHECKING, Any
 
@@ -46,6 +48,7 @@ from lerobot.configs import parser
 from lerobot.configs.train import TrainPipelineConfig
 from lerobot.datasets import (
     EpisodeAwareSampler,
+    LeRobotDatasetMetadata,
     apply_intervention_only_data,
     compute_intervention_only_data,
     make_dataset,
@@ -67,6 +70,235 @@ from lerobot.utils.utils import (
 )
 
 from .lerobot_eval import eval_policy_all
+
+SARM_VALIDATION_METRIC_KEYS = (
+    "total_loss",
+    "sparse_stage_loss",
+    "sparse_subtask_loss",
+    "dense_stage_loss",
+    "dense_subtask_loss",
+)
+
+
+def _is_sarm_validation_requested(cfg: TrainPipelineConfig) -> bool:
+    return (
+        cfg.validation.enable
+        and cfg.is_reward_model_training
+        and cfg.reward_model is not None
+        and cfg.reward_model.type == "sarm"
+    )
+
+
+def resolve_sarm_validation_episodes(
+    candidate_episodes: list[int],
+    *,
+    ratio: float,
+    split: str,
+    validation_episodes: list[int] | None = None,
+) -> tuple[list[int], list[int]]:
+    """Resolve train/validation episode lists without reindexing the dataset."""
+    if split != "tail":
+        raise ValueError(f"validation.split must be 'tail', got {split!r}")
+
+    if len(candidate_episodes) < 2:
+        return list(candidate_episodes), []
+
+    if validation_episodes is not None:
+        val_episodes = list(validation_episodes)
+        val_set = set(val_episodes)
+        train_episodes = [ep for ep in candidate_episodes if ep not in val_set]
+        if not val_episodes:
+            return list(candidate_episodes), []
+        if not train_episodes:
+            raise ValueError("validation.episodes cannot consume all candidate training episodes.")
+        return train_episodes, val_episodes
+
+    val_count = min(max(1, math.ceil(len(candidate_episodes) * ratio)), len(candidate_episodes) - 1)
+    split_at = len(candidate_episodes) - val_count
+    return candidate_episodes[:split_at], candidate_episodes[split_at:]
+
+
+def _validate_episode_range(episodes: list[int], total_episodes: int, name: str) -> None:
+    out_of_range = [ep for ep in episodes if ep >= total_episodes]
+    if out_of_range:
+        raise ValueError(
+            f"{name} contains episode indices outside the dataset range [0, {total_episodes - 1}]: "
+            f"{out_of_range}"
+        )
+
+
+def _resolve_sarm_validation_split(
+    cfg: TrainPipelineConfig,
+    accelerator: "Accelerator",
+    is_main_process: bool,
+) -> tuple[bool, list[int]]:
+    """Resolve and broadcast SARM validation episodes before the training dataset is created."""
+    if not cfg.validation.enable:
+        return False, []
+
+    if not _is_sarm_validation_requested(cfg):
+        if is_main_process:
+            logging.warning("validation.enable=true is only supported for SARM reward model training; skipping.")
+        return False, []
+
+    from accelerate.utils import broadcast_object_list
+
+    payload = [None]
+    if is_main_process:
+        ds_meta = LeRobotDatasetMetadata(
+            cfg.dataset.repo_id,
+            root=cfg.dataset.root,
+            revision=cfg.dataset.revision,
+        )
+        candidate_episodes = (
+            list(cfg.dataset.episodes)
+            if cfg.dataset.episodes is not None
+            else list(range(ds_meta.total_episodes))
+        )
+        _validate_episode_range(candidate_episodes, ds_meta.total_episodes, "dataset.episodes")
+        if cfg.validation.episodes is not None:
+            _validate_episode_range(cfg.validation.episodes, ds_meta.total_episodes, "validation.episodes")
+
+        train_episodes, val_episodes = resolve_sarm_validation_episodes(
+            candidate_episodes,
+            ratio=cfg.validation.ratio,
+            split=cfg.validation.split,
+            validation_episodes=cfg.validation.episodes,
+        )
+        active = len(val_episodes) > 0
+        payload[0] = {
+            "active": active,
+            "train_episodes": train_episodes,
+            "val_episodes": val_episodes,
+            "candidate_count": len(candidate_episodes),
+        }
+
+    split = broadcast_object_list(payload, from_process=0)[0]
+    train_episodes = split["train_episodes"]
+    val_episodes = split["val_episodes"]
+    cfg.validation.resolved_train_episodes = train_episodes
+    cfg.validation.resolved_val_episodes = val_episodes
+
+    if not split["active"]:
+        if is_main_process and split["candidate_count"] < 2:
+            logging.warning(
+                "Skipping SARM validation because at least 2 candidate episodes are required; got %d.",
+                split["candidate_count"],
+            )
+        return False, []
+
+    cfg.dataset.episodes = train_episodes
+    if is_main_process:
+        logging.info(
+            "SARM validation split resolved: train episodes=%s, validation episodes=%s",
+            train_episodes,
+            val_episodes,
+        )
+    return True, val_episodes
+
+
+def _make_dataset_for_episodes(cfg: TrainPipelineConfig, episodes: list[int]):
+    val_cfg = deepcopy(cfg)
+    val_cfg.dataset.episodes = episodes
+    return make_dataset(val_cfg)
+
+
+def _make_offline_sampler(dataset, cfg: TrainPipelineConfig, shuffle: bool):
+    active_cfg = cfg.trainable_config
+    if cfg.dataset.intervention_only and not cfg.dataset.streaming:
+        dataset_from_indices, dataset_to_indices = selected_episode_boundaries(dataset)
+        return (
+            EpisodeAwareSampler(
+                dataset_from_indices,
+                dataset_to_indices,
+                drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
+                shuffle=shuffle,
+                eligible_indices=dataset.intervention_indices,
+            ),
+            False,
+        )
+
+    if hasattr(active_cfg, "drop_n_last_frames") and not cfg.dataset.streaming:
+        if dataset.episodes is None:
+            dataset_from_indices = dataset.meta.episodes["dataset_from_index"]
+            dataset_to_indices = dataset.meta.episodes["dataset_to_index"]
+        else:
+            dataset_from_indices, dataset_to_indices = selected_episode_boundaries(dataset)
+        return (
+            EpisodeAwareSampler(
+                dataset_from_indices,
+                dataset_to_indices,
+                drop_n_last_frames=active_cfg.drop_n_last_frames,
+                shuffle=shuffle,
+            ),
+            False,
+        )
+
+    return None, shuffle
+
+
+def _set_processor_training_mode(processor, mode: bool) -> None:
+    for step in getattr(processor, "steps", ()):
+        if hasattr(step, "train"):
+            step.train(mode)
+
+
+def _as_float(value: Any) -> float | None:
+    if isinstance(value, torch.Tensor):
+        return value.detach().float().mean().item()
+    if isinstance(value, int | float):
+        return float(value)
+    return None
+
+
+def run_sarm_validation(
+    *,
+    policy,
+    preprocessor,
+    val_dataloader,
+    val_dataset,
+    accelerator: "Accelerator",
+    max_batches: int | None,
+) -> dict[str, float]:
+    """Run offline SARM validation on the main process and return averaged metrics."""
+    unwrapped_policy = accelerator.unwrap_model(policy)
+    was_training = policy.training
+    policy.eval()
+    _set_processor_training_mode(preprocessor, False)
+
+    totals: dict[str, float] = {"loss": 0.0}
+    num_batches = 0
+    try:
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(val_dataloader):
+                if max_batches is not None and batch_idx >= max_batches:
+                    break
+
+                for cam_key in val_dataset.meta.camera_keys:
+                    if cam_key in batch and batch[cam_key].dtype == torch.uint8:
+                        batch[cam_key] = batch[cam_key].to(dtype=torch.float32) / 255.0
+
+                batch = preprocessor(batch)
+                with accelerator.autocast():
+                    loss, output_dict = unwrapped_policy.forward(batch)
+
+                totals["loss"] += loss.detach().float().item()
+                if output_dict:
+                    for key in SARM_VALIDATION_METRIC_KEYS:
+                        value = _as_float(output_dict.get(key))
+                        if value is not None:
+                            totals[key] = totals.get(key, 0.0) + value
+                num_batches += 1
+    finally:
+        if was_training:
+            policy.train()
+        _set_processor_training_mode(preprocessor, True)
+
+    if num_batches == 0:
+        logging.warning("SARM validation produced no batches; skipping validation metrics.")
+        return {}
+
+    return {key: value / num_batches for key, value in totals.items()}
 
 
 def update_policy(
@@ -243,6 +475,8 @@ def train(
     else:
         torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
+
+    validation_active, validation_episodes = _resolve_sarm_validation_split(cfg, accelerator, is_main_process)
 
     # Dataset loading synchronization: main process downloads first to avoid race conditions
     if is_main_process:
@@ -446,28 +680,7 @@ def train(
         logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
     # create dataloader for offline training
-    if cfg.dataset.intervention_only and not cfg.dataset.streaming:
-        dataset_from_indices, dataset_to_indices = selected_episode_boundaries(dataset)
-        sampler = EpisodeAwareSampler(
-            dataset_from_indices,
-            dataset_to_indices,
-            drop_n_last_frames=getattr(active_cfg, "drop_n_last_frames", 0),
-            shuffle=True,
-            eligible_indices=dataset.intervention_indices,
-        )
-        shuffle = False
-    elif hasattr(active_cfg, "drop_n_last_frames") and not cfg.dataset.streaming:
-        shuffle = False
-        sampler = EpisodeAwareSampler(
-            dataset.meta.episodes["dataset_from_index"],
-            dataset.meta.episodes["dataset_to_index"],
-            episode_indices_to_use=dataset.episodes,
-            drop_n_last_frames=active_cfg.drop_n_last_frames,
-            shuffle=True,
-        )
-    else:
-        shuffle = True
-        sampler = None
+    sampler, shuffle = _make_offline_sampler(dataset, cfg, shuffle=True)
 
     if is_main_process and cfg.dataset.intervention_only:
         effective_samples = len(sampler) if sampler is not None else dataset.intervention_true_frames
@@ -484,6 +697,33 @@ def train(
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
         persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
     )
+
+    val_dataset = None
+    val_dataloader = None
+    if validation_active and is_main_process:
+        logging.info("Creating SARM validation dataset")
+        val_dataset = _make_dataset_for_episodes(cfg, validation_episodes)
+        if cfg.dataset.intervention_only:
+            val_intervention_data = compute_intervention_only_data(val_dataset)
+            apply_intervention_only_data(val_dataset, val_intervention_data)
+        val_sampler, val_shuffle = _make_offline_sampler(val_dataset, cfg, shuffle=False)
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            num_workers=cfg.num_workers,
+            batch_size=cfg.batch_size,
+            shuffle=val_shuffle and not cfg.dataset.streaming,
+            sampler=val_sampler,
+            pin_memory=device.type == "cuda",
+            drop_last=False,
+            prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
+            persistent_workers=cfg.persistent_workers and cfg.num_workers > 0,
+        )
+        logging.info(
+            "SARM validation dataset: num_frames=%s, num_episodes=%s, max_batches=%s",
+            val_dataset.num_frames,
+            val_dataset.num_episodes,
+            cfg.validation.max_batches,
+        )
 
     # Prepare everything with accelerator
     accelerator.wait_for_everyone()
@@ -567,6 +807,7 @@ def train(
         is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0 and is_main_process
         is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
         is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
+        is_validation_step = validation_active and (step % cfg.validation.freq == 0 or step == cfg.steps)
 
         if is_log_step:
             logging.info(train_tracker)
@@ -580,6 +821,26 @@ def train(
                     wandb_log_dict.update({f"sample_weighting/{k}": v for k, v in weighter_stats.items()})
                 wandb_logger.log_dict(wandb_log_dict, step)
             train_tracker.reset_averages()
+
+        if is_validation_step:
+            if is_main_process:
+                val_metrics = run_sarm_validation(
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    val_dataloader=val_dataloader,
+                    val_dataset=val_dataset,
+                    accelerator=accelerator,
+                    max_batches=cfg.validation.max_batches,
+                )
+                if val_metrics:
+                    logging.info(
+                        "Validation step %s: %s",
+                        step,
+                        " ".join(f"val/{key}:{value:.4f}" for key, value in val_metrics.items()),
+                    )
+                    if wandb_logger:
+                        wandb_logger.log_dict(val_metrics, step, mode="val")
+            accelerator.wait_for_everyone()
 
         if cfg.save_checkpoint and is_saving_step:
             if is_main_process:

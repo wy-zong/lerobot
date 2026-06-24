@@ -685,8 +685,9 @@ class SARMRewardModel(PreTrainedRewardModel):
         # Run stage model
         stage_pred = self.stage_model(img_emb, lang_emb, state, lengths, scheme=scheme)
 
-        # 75%/25% GT/predicted stage conditioning
-        if random.random() < self.gt_stage_ratio:
+        # Training uses 75%/25% GT/predicted stage conditioning. Evaluation always
+        # uses predicted stage conditioning so validation loss is deterministic.
+        if self.training and random.random() < self.gt_stage_ratio:
             # Mode 1: Use ground truth stage -> one-hot
             stage_emb = gen_stage_emb(num_classes, targets)  # (B, 1, T, C)
         else:

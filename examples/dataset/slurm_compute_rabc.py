@@ -28,7 +28,7 @@ Two subcommands, each a separate SLURM submission:
 Usage:
     python slurm_compute_rabc.py compute \\
         --repo-id user/dataset --reward-model-path user/sarm_model \\
-        --stride 10 --device cpu --workers 50 --partition cpu
+        --stride 10 --batch-size 16 --device cpu --workers 50 --partition cpu
 
     python slurm_compute_rabc.py aggregate \\
         --repo-id user/dataset --reward-model-path user/sarm_model \\
@@ -47,17 +47,29 @@ class ComputeProgressShards(PipelineStep):
     """Each worker computes SARM progress for its assigned episodes."""
 
     def __init__(
-        self, repo_id, reward_model_path, stride=1, head_mode="sparse", device="cpu", shard_dir="rabc_shards"
+        self,
+        repo_id,
+        reward_model_path,
+        stride=1,
+        head_mode="sparse",
+        device="cpu",
+        shard_dir="rabc_shards",
+        batch_size=1,
+        precomputed_image_features_path=None,
     ):
         super().__init__()
         if stride < 1:
             raise ValueError(f"stride must be >= 1, got {stride}")
+        if batch_size < 1:
+            raise ValueError(f"batch_size must be >= 1, got {batch_size}")
         self.repo_id = repo_id
         self.reward_model_path = reward_model_path
         self.stride = stride
         self.head_mode = head_mode
         self.device = device
         self.shard_dir = shard_dir
+        self.batch_size = batch_size
+        self.precomputed_image_features_path = precomputed_image_features_path
 
     def run(self, data=None, rank: int = 0, world_size: int = 1):
         import logging
@@ -66,12 +78,14 @@ class ComputeProgressShards(PipelineStep):
         import numpy as np
         import pyarrow as pa
         import pyarrow.parquet as pq
-        import torch
         from tqdm import tqdm
 
         from lerobot.rewards.sarm.compute_rabc_weights import (
+            build_sarm_batch,
             generate_all_frame_indices,
+            infer_sarm_progress_batch,
             interpolate_progress,
+            iter_chunks,
             load_sarm_resources,
         )
         from lerobot.utils.utils import init_logging
@@ -82,6 +96,7 @@ class ComputeProgressShards(PipelineStep):
             self.repo_id,
             self.reward_model_path,
             self.device,
+            precomputed_image_features_path=self.precomputed_image_features_path,
         )
 
         if hasattr(preprocess, "eval"):
@@ -94,6 +109,7 @@ class ComputeProgressShards(PipelineStep):
         state_key = reward_model.config.state_key
         frame_gap = reward_model.config.frame_gap
         center_idx = reward_model.config.n_obs_steps // 2
+        include_image = reward_model.config.precomputed_image_features_path is None
 
         dual_mode = reward_model.config.uses_dual_heads
         compute_sparse = self.head_mode in ("sparse", "both") or not dual_mode
@@ -122,52 +138,55 @@ class ComputeProgressShards(PipelineStep):
                 compute_indices = all_ep_indices
 
             frame_results = {}
-            for qi in tqdm(compute_indices, desc=f"  Ep {ep_idx}", leave=False):
+            for query_batch in tqdm(
+                list(iter_chunks(compute_indices, self.batch_size)),
+                desc=f"  Ep {ep_idx}",
+                leave=False,
+            ):
                 try:
-                    sample = dataset[qi]
-                    batch = {
-                        image_key: sample[image_key],
-                        "task": task,
-                        "index": qi,
-                        "episode_index": ep_idx,
-                    }
-                    if state_key in sample:
-                        batch[state_key] = sample[state_key]
-
-                    with torch.no_grad():
-                        processed = preprocess(batch)
-                        vf = processed["video_features"].to(self.device)
-                        tf = processed["text_features"].to(self.device)
-                        sf = processed.get("state_features")
-                        if sf is not None:
-                            sf = sf.to(self.device)
-                        lengths = processed.get("lengths")
-
-                        sparse_val = dense_val = np.nan
-                        if compute_sparse:
-                            r = reward_model.calculate_rewards(
-                                text_embeddings=tf,
-                                video_embeddings=vf,
-                                state_features=sf,
-                                lengths=lengths,
-                                return_all_frames=True,
-                                head_mode="sparse",
-                            )
-                            sparse_val = float(r[0, center_idx] if r.ndim == 2 else r[center_idx])
-                        if compute_dense:
-                            r = reward_model.calculate_rewards(
-                                text_embeddings=tf,
-                                video_embeddings=vf,
-                                state_features=sf,
-                                lengths=lengths,
-                                return_all_frames=True,
-                                head_mode="dense",
-                            )
-                            dense_val = float(r[0, center_idx] if r.ndim == 2 else r[center_idx])
-
-                        frame_results[qi] = (sparse_val, dense_val)
+                    batch = build_sarm_batch(
+                        dataset, query_batch, image_key, state_key, task, ep_idx, include_image
+                    )
+                    frame_results.update(
+                        infer_sarm_progress_batch(
+                            batch,
+                            query_batch,
+                            reward_model,
+                            preprocess,
+                            self.device,
+                            center_idx,
+                            compute_sparse,
+                            compute_dense,
+                        )
+                    )
                 except Exception as e:
-                    logging.warning(f"Failed frame {qi}: {e}")
+                    if len(query_batch) == 1:
+                        logging.warning(f"Failed frame {query_batch[0]}: {e}")
+                        continue
+
+                    logging.warning(
+                        f"Failed batch {query_batch[0]}-{query_batch[-1]} "
+                        f"(size={len(query_batch)}), retrying individually: {e}"
+                    )
+                    for qi in query_batch:
+                        try:
+                            batch = build_sarm_batch(
+                                dataset, [qi], image_key, state_key, task, ep_idx, include_image
+                            )
+                            frame_results.update(
+                                infer_sarm_progress_batch(
+                                    batch,
+                                    [qi],
+                                    reward_model,
+                                    preprocess,
+                                    self.device,
+                                    center_idx,
+                                    compute_sparse,
+                                    compute_dense,
+                                )
+                            )
+                        except Exception as frame_error:
+                            logging.warning(f"Failed frame {qi}: {frame_error}")
 
             if not frame_results:
                 logging.warning(f"Episode {ep_idx}: all frames failed, skipping")
@@ -290,6 +309,8 @@ def make_compute_executor(
     head_mode,
     device,
     shard_dir,
+    batch_size,
+    precomputed_image_features_path,
     logs_dir,
     job_name,
     slurm,
@@ -300,7 +321,16 @@ def make_compute_executor(
 ):
     kwargs = {
         "pipeline": [
-            ComputeProgressShards(repo_id, reward_model_path, stride, head_mode, device, str(shard_dir)),
+            ComputeProgressShards(
+                repo_id,
+                reward_model_path,
+                stride,
+                head_mode,
+                device,
+                str(shard_dir),
+                batch_size,
+                precomputed_image_features_path,
+            ),
         ],
         "logging_dir": str(logs_dir / job_name),
     }
@@ -454,6 +484,18 @@ def main():
         type=int,
         default=50,
         help="Number of parallel SLURM tasks (one shard per worker).",
+    )
+    cp.add_argument(
+        "--batch-size",
+        type=int,
+        default=1,
+        help="Number of query frames to process per inference batch inside each worker.",
+    )
+    cp.add_argument(
+        "--precomputed-image-features-path",
+        type=str,
+        default=None,
+        help="Path to .npy CLIP image features from lerobot-sarm-precompute-clip.",
     )
 
     # aggregate subcommand

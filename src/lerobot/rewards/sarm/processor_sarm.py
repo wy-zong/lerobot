@@ -116,6 +116,7 @@ class SARMEncodingProcessorStep(ProcessorStep):
         self.clip_processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32", use_fast=True)
         self.clip_model.to(self.device)
         self.clip_model.eval()
+        self._text_feature_cache: dict[str, torch.Tensor] = {}
 
         self.verbs = ["move", "grasp", "rotate", "push", "pull", "slide", "lift", "place"]
         self.fake = Faker()
@@ -526,6 +527,9 @@ class SARMEncodingProcessorStep(ProcessorStep):
         Returns:
             Encoded text features with shape (B, 512)
         """
+        if text in self._text_feature_cache:
+            return self._text_feature_cache[text].expand(batch_size, -1)
+
         inputs = self.clip_processor.tokenizer([text], return_tensors="pt", padding=True, truncation=True)
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
@@ -536,9 +540,9 @@ class SARMEncodingProcessorStep(ProcessorStep):
             if output is None:
                 raise ValueError("pooler_output should not be None for CLIP models.")
         text_embedding = output.detach().cpu()
-        text_embedding = text_embedding.expand(batch_size, -1)
+        self._text_feature_cache[text] = text_embedding
 
-        return text_embedding
+        return text_embedding.expand(batch_size, -1)
 
     def transform_features(
         self, features: dict[PipelineFeatureType, dict[str, PolicyFeature]]

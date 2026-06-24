@@ -15,6 +15,7 @@ import draccus
 import pytest
 
 from lerobot.configs.default import DatasetConfig
+from lerobot.configs.train import ValidationConfig
 
 
 def test_dataset_config_valid():
@@ -53,3 +54,30 @@ def test_dataset_config_intervention_only_cli_true():
         args=["--repo_id=user/repo", "--intervention_only=true"],
     )
     assert config.intervention_only is True
+
+
+def test_validation_config_defaults_disabled():
+    cfg = ValidationConfig()
+
+    assert cfg.enable is False
+    assert cfg.ratio == 0.2
+    assert cfg.freq == 1000
+    assert cfg.max_batches == 64
+    assert cfg.episodes is None
+    assert cfg.split == "tail"
+
+
+@pytest.mark.parametrize("ratio", [0.0, -0.1, 1.0, 1.5])
+def test_validation_config_rejects_invalid_ratio(ratio):
+    with pytest.raises(ValueError, match="validation.ratio"):
+        ValidationConfig(ratio=ratio)
+
+
+def test_validation_config_rejects_unsupported_split():
+    with pytest.raises(ValueError, match="validation.split"):
+        ValidationConfig(split="random")
+
+
+def test_validation_config_rejects_duplicate_episodes():
+    with pytest.raises(ValueError, match="duplicates"):
+        ValidationConfig(episodes=[1, 1])

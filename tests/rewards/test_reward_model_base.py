@@ -325,6 +325,189 @@ def test_train_pipeline_config_from_pretrained_strips_legacy_rabc_when_disabled(
     assert loaded.sample_weighting is None
 
 
+def test_sarm_validation_default_tail_split():
+    from lerobot.scripts.lerobot_train import resolve_sarm_validation_episodes
+
+    train_episodes, val_episodes = resolve_sarm_validation_episodes(
+        list(range(10)),
+        ratio=0.2,
+        split="tail",
+    )
+
+    assert train_episodes == list(range(8))
+    assert val_episodes == [8, 9]
+
+
+def test_sarm_validation_tail_split_respects_dataset_episode_candidates():
+    from lerobot.scripts.lerobot_train import resolve_sarm_validation_episodes
+
+    train_episodes, val_episodes = resolve_sarm_validation_episodes(
+        [5, 6, 7, 8, 9],
+        ratio=0.2,
+        split="tail",
+    )
+
+    assert train_episodes == [5, 6, 7, 8]
+    assert val_episodes == [9]
+
+
+def test_sarm_validation_explicit_episodes_are_excluded_from_train():
+    from lerobot.scripts.lerobot_train import resolve_sarm_validation_episodes
+
+    train_episodes, val_episodes = resolve_sarm_validation_episodes(
+        [0, 1, 2, 3, 4],
+        ratio=0.2,
+        split="tail",
+        validation_episodes=[1, 3],
+    )
+
+    assert train_episodes == [0, 2, 4]
+    assert val_episodes == [1, 3]
+
+
+def test_sarm_validation_split_skips_when_candidate_episode_count_is_too_small():
+    from lerobot.scripts.lerobot_train import resolve_sarm_validation_episodes
+
+    train_episodes, val_episodes = resolve_sarm_validation_episodes(
+        [7],
+        ratio=0.2,
+        split="tail",
+    )
+
+    assert train_episodes == [7]
+    assert val_episodes == []
+
+
+def test_sarm_validation_disabled_does_not_modify_dataset_episodes():
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.scripts.lerobot_train import _resolve_sarm_validation_split
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo", episodes=[0, 1]),
+        policy=DiffusionConfig(device="cpu"),
+    )
+
+    active, val_episodes = _resolve_sarm_validation_split(
+        cfg,
+        accelerator=SimpleNamespace(),
+        is_main_process=True,
+    )
+
+    assert active is False
+    assert val_episodes == []
+    assert cfg.dataset.episodes == [0, 1]
+
+
+def test_validation_enabled_for_non_sarm_training_does_not_modify_dataset_episodes():
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig, ValidationConfig
+    from lerobot.rewards.classifier.configuration_classifier import RewardClassifierConfig
+    from lerobot.scripts.lerobot_train import _resolve_sarm_validation_split
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo", episodes=[0, 1]),
+        reward_model=RewardClassifierConfig(device="cpu"),
+        validation=ValidationConfig(enable=True),
+    )
+
+    active, val_episodes = _resolve_sarm_validation_split(
+        cfg,
+        accelerator=SimpleNamespace(),
+        is_main_process=True,
+    )
+
+    assert active is False
+    assert val_episodes == []
+    assert cfg.dataset.episodes == [0, 1]
+
+
+def test_filtered_sarm_validation_sampler_yields_dataset_relative_indices(monkeypatch):
+    from lerobot.scripts.lerobot_train import _make_offline_sampler
+
+    dataset = SimpleNamespace(
+        episodes=[158, 159],
+        meta=SimpleNamespace(
+            episodes={
+                "dataset_from_index": [437892, 440000],
+                "dataset_to_index": [440000, 443000],
+            }
+        ),
+    )
+    cfg = SimpleNamespace(
+        trainable_config=SimpleNamespace(drop_n_last_frames=1),
+        dataset=SimpleNamespace(intervention_only=False, streaming=False),
+    )
+    monkeypatch.setattr(
+        "lerobot.scripts.lerobot_train.selected_episode_boundaries",
+        lambda _dataset: ([0, 2108], [2108, 5108]),
+    )
+
+    sampler, shuffle = _make_offline_sampler(dataset, cfg, shuffle=False)
+    indices = list(sampler)
+
+    assert shuffle is False
+    assert indices[0] == 0
+    assert indices[-1] == 5106
+    assert max(indices) < 5108
+    assert 2107 not in indices
+
+
+def test_sarm_train_step_uses_predicted_stage_conditioning_in_eval(monkeypatch):
+    from lerobot.rewards.sarm.configuration_sarm import SARMConfig
+    from lerobot.rewards.sarm.modeling_sarm import SARMRewardModel
+
+    class FakeStageModel(torch.nn.Module):
+        def forward(self, img_emb, lang_emb, state, lengths, scheme):
+            batch_size, _, seq_len, _ = img_emb.shape
+            logits = torch.zeros(batch_size, seq_len, 2)
+            logits[..., 1] = 10.0
+            return logits
+
+    class FakeSubtaskModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.stage_prior = None
+
+        def forward(self, img_emb, lang_emb, state, lengths, stage_prior, scheme):
+            self.stage_prior = stage_prior.detach().clone()
+            return torch.zeros(img_emb.shape[0], img_emb.shape[2])
+
+    cfg = SARMConfig(
+        annotation_mode="single_stage",
+        image_dim=2,
+        text_dim=2,
+        hidden_dim=4,
+        num_heads=1,
+        num_layers=1,
+        max_state_dim=2,
+        dropout=0.0,
+        device="cpu",
+    )
+    cfg.num_sparse_stages = 2
+    cfg.sparse_subtask_names = ["gt", "pred"]
+    cfg.sparse_temporal_proportions = [0.5, 0.5]
+    model = SARMRewardModel(cfg)
+    model.stage_model = FakeStageModel()
+    model.subtask_model = FakeSubtaskModel()
+
+    img_emb = torch.zeros(1, 1, 2, 2)
+    lang_emb = torch.zeros(1, 2)
+    state = torch.zeros(1, 2, 2)
+    lengths = torch.tensor([2])
+    targets = torch.zeros(1, 2)
+
+    monkeypatch.setattr("lerobot.rewards.sarm.modeling_sarm.random.random", lambda: 0.0)
+    model.train()
+    model._train_step(img_emb, lang_emb, state, lengths, targets, scheme="sparse")
+    assert model.subtask_model.stage_prior[..., 0].eq(1).all()
+
+    model.eval()
+    model._train_step(img_emb, lang_emb, state, lengths, targets, scheme="sparse")
+    assert model.subtask_model.stage_prior[..., 1].eq(1).all()
+
+
 # ---------------------------------------------------------------------------
 # PreTrainedRewardModel hub upload: push_model_to_hub + generate_model_card.
 # We test the generation side (offline) fully, and the upload side with HfApi

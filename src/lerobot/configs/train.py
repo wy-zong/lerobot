@@ -74,6 +74,40 @@ def _migrate_legacy_rabc_fields(config: dict[str, Any]) -> dict[str, Any] | None
 
 
 @dataclass
+class ValidationConfig:
+    """Optional offline validation settings for reward model training."""
+
+    enable: bool = False
+    ratio: float = 0.2
+    freq: int = 1000
+    max_batches: int | None = 64
+    episodes: list[int] | None = None
+    split: str = "tail"
+    resolved_train_episodes: list[int] | None = None
+    resolved_val_episodes: list[int] | None = None
+
+    def __post_init__(self) -> None:
+        if not 0 < self.ratio < 1:
+            raise ValueError(f"validation.ratio must be > 0 and < 1, got {self.ratio}")
+        if self.freq <= 0:
+            raise ValueError(f"validation.freq must be positive, got {self.freq}")
+        if self.max_batches is not None and self.max_batches <= 0:
+            raise ValueError(f"validation.max_batches must be positive or None, got {self.max_batches}")
+        if self.split != "tail":
+            raise ValueError(f"validation.split must be 'tail', got {self.split!r}")
+
+        for field_name in ("episodes", "resolved_train_episodes", "resolved_val_episodes"):
+            episodes = getattr(self, field_name)
+            if episodes is None:
+                continue
+            if any(ep < 0 for ep in episodes):
+                raise ValueError(f"validation.{field_name} indices must be non-negative, got {episodes}")
+            if len(episodes) != len(set(episodes)):
+                duplicates = sorted({ep for ep in episodes if episodes.count(ep) > 1})
+                raise ValueError(f"validation.{field_name} contains duplicates: {duplicates}")
+
+
+@dataclass
 class TrainPipelineConfig(HubMixin):
     dataset: DatasetConfig
     env: envs.EnvConfig | None = None
@@ -110,6 +144,7 @@ class TrainPipelineConfig(HubMixin):
     optimizer: OptimizerConfig | None = None
     scheduler: LRSchedulerConfig | None = None
     eval: EvalConfig = field(default_factory=EvalConfig)
+    validation: ValidationConfig = field(default_factory=ValidationConfig)
     wandb: WandBConfig = field(default_factory=WandBConfig)
     peft: PeftConfig | None = None
     use_subtasks: bool = False

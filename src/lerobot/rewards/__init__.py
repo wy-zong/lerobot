@@ -20,11 +20,13 @@ from .factory import (
     make_reward_pre_post_processors as make_reward_pre_post_processors,
 )
 from .pretrained import PreTrainedRewardModel as PreTrainedRewardModel
+from .recap_sarm.configuration_recap_sarm import RECAPSARMConfig as RECAPSARMConfig
 from .sarm.configuration_sarm import SARMConfig as SARMConfig
 
 __all__ = [
     # Configuration classes
     "RewardClassifierConfig",
+    "RECAPSARMConfig",
     "SARMConfig",
     # Base class
     "PreTrainedRewardModel",

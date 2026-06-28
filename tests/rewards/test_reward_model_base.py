@@ -50,6 +50,7 @@ def test_reward_model_config_registry():
     """Verify that classifier and sarm are registered."""
     known = RewardModelConfig.get_known_choices()
     assert "reward_classifier" in known
+    assert "recap_sarm" in known
     assert "sarm" in known
 
 
@@ -69,6 +70,21 @@ def test_factory_get_reward_model_class():
     from lerobot.rewards.sarm.modeling_sarm import SARMRewardModel
 
     assert cls is SARMRewardModel
+
+    recap_cls = get_reward_model_class("recap_sarm")
+    from lerobot.rewards.recap_sarm.modeling_recap_sarm import RECAPSARMRewardModel
+
+    assert recap_cls is RECAPSARMRewardModel
+
+
+def test_factory_make_reward_model_config():
+    from lerobot.rewards.factory import make_reward_model_config
+
+    cfg = make_reward_model_config("recap_sarm")
+
+    from lerobot.rewards.recap_sarm.configuration_recap_sarm import RECAPSARMConfig
+
+    assert isinstance(cfg, RECAPSARMConfig)
 
 
 def test_factory_unknown_raises():

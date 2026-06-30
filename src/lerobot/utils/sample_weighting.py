@@ -132,6 +132,28 @@ def make_sample_weighter(
     raise ValueError(f"Unknown sample weighting type: '{config.type}'. Supported types: 'rabc', 'uniform'")
 
 
+def resolve_sarm_progress_path(
+    progress_path: str | Path | None,
+    *,
+    dataset_root: str | Path | None = None,
+    dataset_repo_id: str | None = None,
+    feature_name: str = "SARM",
+) -> str:
+    """Resolve an explicit or dataset-relative SARM progress parquet path."""
+    if progress_path is not None:
+        return str(progress_path)
+    if dataset_root:
+        return str(Path(dataset_root) / "sarm_progress.parquet")
+    if dataset_repo_id:
+        return f"hf://datasets/{dataset_repo_id}/sarm_progress.parquet"
+    raise ValueError(
+        f"{feature_name} requires 'progress_path' to be set, "
+        "or dataset_root/dataset_repo_id for auto-detection. "
+        "Generate progress values using: "
+        "python -m lerobot.rewards.sarm.compute_rabc_weights --help"
+    )
+
+
 def _make_rabc_weighter(
     config: SampleWeightingConfig,
     policy: PreTrainedPolicy,
@@ -160,19 +182,12 @@ def _make_rabc_weighter(
         )
 
     # Determine progress_path: use explicit config or auto-detect from dataset
-    progress_path = config.progress_path
-    if progress_path is None:
-        if dataset_root:
-            progress_path = str(Path(dataset_root) / "sarm_progress.parquet")
-        elif dataset_repo_id:
-            progress_path = f"hf://datasets/{dataset_repo_id}/sarm_progress.parquet"
-        else:
-            raise ValueError(
-                "RABC sample weighting requires 'progress_path' to be set, "
-                "or dataset_root/dataset_repo_id for auto-detection. "
-                "Generate progress values using: "
-                "python -m lerobot.rewards.sarm.compute_rabc_weights --help"
-            )
+    progress_path = resolve_sarm_progress_path(
+        config.progress_path,
+        dataset_root=dataset_root,
+        dataset_repo_id=dataset_repo_id,
+        feature_name="RABC sample weighting",
+    )
 
     return RABCWeights(
         progress_path=progress_path,

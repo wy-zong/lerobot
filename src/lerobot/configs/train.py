@@ -28,6 +28,7 @@ from lerobot import envs
 from lerobot.optim import LRSchedulerConfig, OptimizerConfig
 from lerobot.utils.hub import HubMixin
 from lerobot.utils.sample_weighting import SampleWeightingConfig
+from lerobot.utils.task_conditioning import SARMTaskConditioningConfig
 
 from . import parser
 from .default import DatasetConfig, EvalConfig, PeftConfig, WandBConfig
@@ -152,6 +153,9 @@ class TrainPipelineConfig(HubMixin):
     # Sample weighting configuration (e.g., for RA-BC training)
     sample_weighting: SampleWeightingConfig | None = None
 
+    # Training-time task text conditioning (e.g., binary labels from SARM progress)
+    task_conditioning: SARMTaskConditioningConfig | None = None
+
     # Rename map for the observation to override the image and state keys
     rename_map: dict[str, str] = field(default_factory=dict)
     checkpoint_path: Path | None = field(init=False, default=None)
@@ -211,6 +215,14 @@ class TrainPipelineConfig(HubMixin):
                 "Neither policy nor reward_model is configured. "
                 "Please specify one with `--policy.path` or `--reward_model.path`."
             )
+
+        if self.task_conditioning is not None:
+            if self.is_reward_model_training:
+                raise ValueError("task_conditioning is only supported for policy training.")
+            if self.sample_weighting is not None and self.sample_weighting.type == "rabc":
+                raise ValueError(
+                    "task_conditioning.type=sarm_binary cannot be combined with sample_weighting.type=rabc."
+                )
 
         active_cfg = self.trainable_config
         if not self.job_name:

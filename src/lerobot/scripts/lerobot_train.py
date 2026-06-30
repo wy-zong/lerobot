@@ -61,6 +61,7 @@ from lerobot.rewards import make_reward_pre_post_processors
 from lerobot.utils.import_utils import register_third_party_plugins
 from lerobot.utils.logging_utils import AverageMeter, MetricsTracker
 from lerobot.utils.random_utils import set_seed
+from lerobot.utils.task_conditioning import make_task_conditioner
 from lerobot.utils.utils import (
     cycle,
     format_big_number,
@@ -637,6 +638,18 @@ def train(
             dataset_repo_id=cfg.dataset.repo_id,
         )
 
+    task_conditioner = None
+    if cfg.task_conditioning is not None:
+        if is_main_process:
+            logging.info(f"Creating task conditioner: {cfg.task_conditioning.type}")
+        task_conditioner = make_task_conditioner(
+            cfg.task_conditioning,
+            dataset=dataset,
+            policy=policy,
+            dataset_root=cfg.dataset.root,
+            dataset_repo_id=cfg.dataset.repo_id,
+        )
+
     step = 0  # number of policy updates (forward + backward + optim)
 
     if cfg.resume:
@@ -780,6 +793,9 @@ def train(
                     "Make sure your dataset provides subtask annotations. Falling back to default 'task' key."
                 )
                 has_warned_missing_subtask = True
+
+        if task_conditioner is not None:
+            task_conditioner.condition_batch(batch)
 
         for cam_key in dataset.meta.camera_keys:
             if cam_key in batch and batch[cam_key].dtype == torch.uint8:

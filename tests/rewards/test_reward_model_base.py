@@ -268,6 +268,69 @@ def test_train_pipeline_config_trainable_config_returns_policy_when_set():
     assert cfg.trainable_config.device == "cpu"
 
 
+def test_train_pipeline_config_rejects_sarm_conditioning_with_rabc(tmp_path):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.utils.sample_weighting import SampleWeightingConfig
+    from lerobot.utils.task_conditioning import SARMTaskConditioningConfig
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo"),
+        policy=DiffusionConfig(device="cpu", push_to_hub=False),
+        output_dir=tmp_path / "output",
+        sample_weighting=SampleWeightingConfig(type="rabc"),
+        task_conditioning=SARMTaskConditioningConfig(),
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        cfg.validate()
+
+
+def test_train_pipeline_config_allows_sarm_conditioning_with_uniform_weighting(tmp_path):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.utils.sample_weighting import SampleWeightingConfig
+    from lerobot.utils.task_conditioning import SARMTaskConditioningConfig
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo"),
+        policy=DiffusionConfig(device="cpu", push_to_hub=False),
+        output_dir=tmp_path / "output",
+        sample_weighting=SampleWeightingConfig(type="uniform"),
+        task_conditioning=SARMTaskConditioningConfig(),
+    )
+
+    cfg.validate()
+
+
+def test_train_pipeline_config_round_trips_sarm_task_conditioning(tmp_path):
+    from lerobot.configs.default import DatasetConfig
+    from lerobot.configs.train import TrainPipelineConfig
+    from lerobot.policies.diffusion.configuration_diffusion import DiffusionConfig
+    from lerobot.utils.task_conditioning import SARMTaskConditioningConfig
+
+    cfg = TrainPipelineConfig(
+        dataset=DatasetConfig(repo_id="user/repo"),
+        policy=DiffusionConfig(device="cpu", push_to_hub=False),
+        task_conditioning=SARMTaskConditioningConfig(
+            progress_path="progress.parquet",
+            head_mode="dense",
+            threshold=0.25,
+        ),
+    )
+    cfg._save_pretrained(tmp_path)
+
+    loaded = TrainPipelineConfig.from_pretrained(tmp_path)
+
+    assert loaded.task_conditioning is not None
+    assert loaded.task_conditioning.type == "sarm_binary"
+    assert loaded.task_conditioning.progress_path == "progress.parquet"
+    assert loaded.task_conditioning.head_mode == "dense"
+    assert loaded.task_conditioning.threshold == 0.25
+
+
 def test_train_pipeline_config_from_pretrained_migrates_legacy_rabc_fields(tmp_path):
     """Legacy top-level RA-BC fields should be migrated into ``sample_weighting``."""
     from lerobot.configs.default import DatasetConfig

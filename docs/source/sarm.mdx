@@ -496,6 +496,34 @@ The training script automatically:
 | `--sample_weighting.kappa`         | Threshold κ for high-quality samples                   | `0.01`                  |
 | `--sample_weighting.epsilon`       | Small constant for numerical stability                 | `1e-6`                  |
 
+### Step 5c: Train with Binary SARM Task Conditioning
+
+As an alternative to RA-BC weighting, keep every sample at the normal BC loss weight and append a
+binary SARM label to its task text:
+
+```bash
+lerobot-train \
+  --dataset.repo_id=your-username/your-dataset \
+  --policy.type=pi0 \
+  --task_conditioning.type=sarm_binary \
+  --task_conditioning.head_mode=sparse \
+  --task_conditioning.threshold=0.01 \
+  --output_dir=outputs/train/policy_sarm_binary \
+  --batch_size=32 \
+  --steps=40000
+```
+
+The progress file is resolved the same way as RA-BC: set
+`--task_conditioning.progress_path`, or place `sarm_progress.parquet` in the dataset root. For each
+action chunk, any frame with `intervention=true` produces `task:positive`. A fully autonomous chunk
+is positive only when `progress[t+chunk_size] - progress[t]` is strictly greater than `threshold`;
+all other deltas are negative. The resulting task text is, for example,
+`Pick up the cube task:positive`.
+
+This mode cannot be combined with `--sample_weighting.type=rabc`. It does not modify rollout or
+checkpoint preprocessors. At inference time, provide the complete desired task text yourself,
+including `task:positive`.
+
 ### Tuning RA-BC Kappa
 
 The `kappa` parameter is the threshold that determines which samples get full weight (w=1). Understanding how to tune it is critical for RA-BC to work effectively.

@@ -226,8 +226,13 @@ class DatasetWriter:
         self,
         episode_data: dict | None = None,
         parallel_encoding: bool = True,
+        episode_metadata: dict | None = None,
     ) -> None:
-        """Save the current episode in self.episode_buffer to disk."""
+        """Save the current episode in self.episode_buffer to disk.
+
+        ``episode_metadata`` is persisted in ``meta/episodes`` and is not
+        treated as frame data.
+        """
         episode_buffer = episode_data if episode_data is not None else self.episode_buffer
 
         validate_episode_buffer(episode_buffer, self._meta.total_episodes, self._meta.features)
@@ -317,6 +322,9 @@ class DatasetWriter:
             else:
                 for video_key in self._meta.video_keys:
                     ep_metadata.update(self._save_episode_video(video_key, episode_index))
+
+        if episode_metadata is not None:
+            ep_metadata.update(episode_metadata)
 
         # `meta.save_episode` need to be executed after encoding the videos
         self._meta.save_episode(episode_index, episode_length, episode_tasks, ep_stats, ep_metadata)

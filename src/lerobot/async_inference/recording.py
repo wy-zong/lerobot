@@ -126,6 +126,11 @@ class RemoteRolloutRecorder:
         self._save_requested = Event()
         self._recording_live = Event()
         self._push_requested = Event()
+        self._episode_label_listener = None
+        self._episode_label_requested = Event()
+        self._episode_label_ready = Event()
+        self._episode_label_lock = Lock()
+        self._episode_success: bool | None = None
 
         if not self.enabled:
             return
@@ -180,11 +185,13 @@ class RemoteRolloutRecorder:
     def start(self, shutdown_event: Event) -> None:
         if not self.enabled or self._started:
             return
+        if self.cfg.label_episode_success:
+            self._setup_episode_label_keyboard(shutdown_event)
         self._video_manager = VideoEncodingManager(self.dataset)
         self._video_manager.__enter__()
         self._started = True
         self.reset_episode_timer()
-        if isinstance(self.strategy, HighlightStrategyConfig):
+        if isinstance(self.strategy, HighlightStrategyConfig) and not self.cfg.label_episode_success:
             self._setup_highlight_keyboard(shutdown_event)
 
     def close(self) -> None:
@@ -202,6 +209,10 @@ class RemoteRolloutRecorder:
         if self._highlight_listener is not None:
             self._highlight_listener.stop()
             self._highlight_listener = None
+
+        if self._episode_label_listener is not None:
+            self._episode_label_listener.stop()
+            self._episode_label_listener = None
 
         if self._push_executor is not None:
             self._push_executor.shutdown(wait=True)
@@ -297,8 +308,14 @@ class RemoteRolloutRecorder:
             return False
         if require_pending and not _dataset_has_pending_frames(self.dataset):
             return False
+        episode_metadata = None
+        if self.cfg.label_episode_success:
+            episode_metadata = {"episode_success": self._request_episode_success_label()}
         with self._episode_lock:
-            self.dataset.save_episode()
+            if episode_metadata is None:
+                self.dataset.save_episode()
+            else:
+                self.dataset.save_episode(episode_metadata=episode_metadata)
         self._needs_push.set()
         self._episodes_since_push += 1
         self.logger.info("Episode saved (total: %d)", self.dataset.num_episodes)
@@ -331,6 +348,77 @@ class RemoteRolloutRecorder:
         )
         self.reset_episode_timer()
         return saved
+
+    def _capture_episode_label_key(self, key) -> bool:
+        if not self._episode_label_requested.is_set():
+            return False
+        with contextlib.suppress(Exception):
+            char = key.char.lower()
+            if char not in {"s", "f"}:
+                return False
+            with self._episode_label_lock:
+                self._episode_success = char == "s"
+                self._episode_label_ready.set()
+            return True
+        return False
+
+    def _setup_episode_label_keyboard(self, shutdown_event: Event) -> None:
+        if _is_headless_linux():
+            raise RuntimeError(
+                "Episode success labeling requires keyboard access, but no graphical display is available"
+            )
+
+        try:
+            from pynput import keyboard
+        except Exception as e:
+            raise RuntimeError("Could not start episode success keyboard listener") from e
+
+        def on_press(key):
+            if self._capture_episode_label_key(key):
+                return None
+
+            if isinstance(self.strategy, HighlightStrategyConfig):
+                with contextlib.suppress(Exception):
+                    if hasattr(key, "char") and key.char == self.strategy.save_key:
+                        self._save_requested.set()
+                    elif hasattr(key, "char") and key.char == self.strategy.push_key:
+                        self._push_requested.set()
+                    elif key == keyboard.Key.esc:
+                        self._save_requested.clear()
+                        shutdown_event.set()
+            return None
+
+        try:
+            self._episode_label_listener = keyboard.Listener(on_press=on_press)
+            self._episode_label_listener.start()
+        except Exception as e:
+            self._episode_label_listener = None
+            raise RuntimeError("Could not start episode success keyboard listener") from e
+        self.logger.info("Episode success keyboard listener started (S=success, F=failure)")
+
+    def _request_episode_success_label(self) -> bool:
+        if self._episode_label_listener is None:
+            raise RuntimeError("Episode success keyboard listener is not running")
+
+        with self._episode_label_lock:
+            self._episode_success = None
+            self._episode_label_ready.clear()
+            self._episode_label_requested.set()
+
+        self.logger.info("Episode ended. Press S for success or F for failure.")
+        log_say("Press S for success or F for failure", self.cfg.play_sounds)
+        try:
+            self._episode_label_ready.wait()
+        finally:
+            self._episode_label_requested.clear()
+
+        with self._episode_label_lock:
+            if self._episode_success is None:
+                raise RuntimeError("Episode success label was not captured")
+            episode_success = self._episode_success
+
+        self.logger.info("Episode labeled as %s", "success" if episode_success else "failure")
+        return episode_success
 
     def background_push(self) -> None:
         if self._push_executor is None or self.dataset is None:
@@ -696,6 +784,8 @@ class RemoteDAggerController:
         }
 
         def on_press(key):
+            if self.recorder._episode_label_requested.is_set():
+                return
             with contextlib.suppress(Exception):
                 resolved = resolve_key(key)
                 if resolved is None:

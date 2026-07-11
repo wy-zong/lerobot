@@ -178,9 +178,6 @@ def update_meta_data(
         pd.DataFrame: Updated DataFrame with adjusted indices and timestamps.
     """
 
-    df["meta/episodes/chunk_index"] = df["meta/episodes/chunk_index"] + meta_idx["chunk"]
-    df["meta/episodes/file_index"] = df["meta/episodes/file_index"] + meta_idx["file"]
-
     # Update data file indices using source-to-destination mapping
     # This is critical for handling datasets that are already results of a merge
     data_src_to_dst = data_idx.get("src_to_dst", {})
@@ -595,6 +592,10 @@ def aggregate_metadata(src_meta, dst_meta, meta_idx, data_idx, videos_idx):
             DEFAULT_EPISODES_PATH,
             contains_images=False,
             aggr_root=dst_meta.root,
+            destination_index_columns=(
+                "meta/episodes/chunk_index",
+                "meta/episodes/file_index",
+            ),
         )
 
     # Increment latest_duration by the total duration added from this source dataset
@@ -614,6 +615,7 @@ def append_or_create_parquet_file(
     contains_images: bool = False,
     aggr_root: Path = None,
     hf_features: datasets.Features | None = None,
+    destination_index_columns: tuple[str, str] | None = None,
 ) -> tuple[dict[str, int], tuple[int, int]]:
     """Appends data to an existing parquet file or creates a new one based on size constraints.
 
@@ -630,6 +632,10 @@ def append_or_create_parquet_file(
         contains_images: Whether the data contains images requiring special handling.
         aggr_root: Root path for the aggregated dataset.
         hf_features: Optional HuggingFace Features schema for proper image typing.
+        destination_index_columns: Optional ``(chunk_column, file_column)`` pair to rewrite
+            with the actual destination parquet indices before writing. This is required for
+            metadata files because source shards may be compacted into a different destination
+            shard during aggregation.
 
     Returns:
         tuple: (updated_idx, (dst_chunk, dst_file)) where updated_idx is the index dict
@@ -639,6 +645,10 @@ def append_or_create_parquet_file(
     dst_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
 
     if not dst_path.exists():
+        if destination_index_columns is not None:
+            chunk_column, file_column = destination_index_columns
+            df[chunk_column] = dst_chunk
+            df[file_column] = dst_file
         dst_path.parent.mkdir(parents=True, exist_ok=True)
         if contains_images:
             to_parquet_with_hf_images(df, dst_path, features=hf_features)
@@ -654,7 +664,6 @@ def append_or_create_parquet_file(
         dst_chunk, dst_file = idx["chunk"], idx["file"]
         new_path = aggr_root / default_path.format(chunk_index=dst_chunk, file_index=dst_file)
         new_path.parent.mkdir(parents=True, exist_ok=True)
-        final_df = df
         target_path = new_path
     else:
         if contains_images:
@@ -663,8 +672,14 @@ def append_or_create_parquet_file(
             existing_df = existing_ds.to_pandas()
         else:
             existing_df = pd.read_parquet(dst_path)
-        final_df = pd.concat([existing_df, df], ignore_index=True)
         target_path = dst_path
+
+    if destination_index_columns is not None:
+        chunk_column, file_column = destination_index_columns
+        df[chunk_column] = dst_chunk
+        df[file_column] = dst_file
+
+    final_df = pd.concat([existing_df, df], ignore_index=True) if target_path == dst_path else df
 
     if contains_images:
         to_parquet_with_hf_images(final_df, target_path, features=hf_features)

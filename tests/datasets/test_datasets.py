@@ -19,6 +19,7 @@ from itertools import chain
 from pathlib import Path
 
 import numpy as np
+import pyarrow.parquet as pq
 import pytest
 import torch
 
@@ -1057,6 +1058,22 @@ def test_multi_episode_metadata_consistency(tmp_path, empty_lerobot_dataset_fact
         assert episode_metadata["dataset_to_index"] == expected_to
 
         cumulative_frames += frames_per_episode[episode_idx]
+
+
+def test_save_episode_persists_custom_episode_metadata(tmp_path, empty_lerobot_dataset_factory):
+    features = {
+        "state": {"dtype": "float32", "shape": (1,), "names": None},
+        ACTION: {"dtype": "float32", "shape": (1,), "names": None},
+    }
+    dataset = empty_lerobot_dataset_factory(root=tmp_path / "test", features=features, use_videos=False)
+    dataset.add_frame({"state": torch.zeros(1), ACTION: torch.zeros(1), "task": "pick"})
+
+    dataset.save_episode(episode_metadata={"episode_success": False})
+    dataset.finalize()
+
+    episodes_file = next((dataset.root / "meta" / "episodes").rglob("*.parquet"))
+    episode_metadata = pq.read_table(episodes_file).to_pylist()[0]
+    assert episode_metadata["episode_success"] is False
 
 
 def test_data_consistency_across_episodes(tmp_path, empty_lerobot_dataset_factory):

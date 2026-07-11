@@ -137,6 +137,7 @@ class _FakeDataset:
     def __init__(self):
         self.frames = []
         self.saved = 0
+        self.saved_episode_metadata = []
         self.finalized = False
         self.pushed = 0
         self.repo_id = "user/rollout_fake"
@@ -148,8 +149,9 @@ class _FakeDataset:
     def add_frame(self, frame):
         self.frames.append(frame)
 
-    def save_episode(self):
+    def save_episode(self, episode_metadata=None):
         self.saved += 1
+        self.saved_episode_metadata.append(episode_metadata)
         self.frames.clear()
 
     def has_pending_frames(self):
@@ -366,6 +368,113 @@ def test_remote_sentry_recorder_rotates_and_queues_push(monkeypatch):
 
     assert fake_dataset.saved == 1
     assert push_calls == [recorder]
+
+
+@pytest.mark.parametrize(
+    ("pressed_key", "expected_success"),
+    [("s", True), ("S", True), ("f", False), ("F", False)],
+)
+def test_remote_recorder_labels_episode_success_with_single_key(
+    monkeypatch, pressed_key, expected_success
+):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import SentryStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    fake_pynput, _, fake_listener = _make_fake_pynput_module()
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput)
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: _FakeDataset())
+
+    robot = MockRobot(MockRobotConfig(n_motors=3))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=SentryStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_sentry", video=False),
+        label_episode_success=True,
+        play_sounds=False,
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    recorder._setup_episode_label_keyboard(threading.Event())
+    recorder._episode_label_requested.set()
+
+    listener = fake_listener.instances[-1]
+    listener.on_press(SimpleNamespace(char="x"))
+    assert not recorder._episode_label_ready.is_set()
+
+    listener.on_press(SimpleNamespace(char=pressed_key))
+
+    assert recorder._episode_label_ready.is_set()
+    assert recorder._episode_success is expected_success
+
+
+def test_remote_recorder_persists_episode_success_metadata(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import SentryStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    fake_dataset = _FakeDataset()
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: fake_dataset)
+    monkeypatch.setattr(RemoteRolloutRecorder, "_request_episode_success_label", lambda _self: False)
+
+    robot = MockRobot(MockRobotConfig(n_motors=3))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=SentryStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_sentry", video=False),
+        label_episode_success=True,
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    recorder.add_frame(
+        {"motor_1.pos": 1.0, "motor_2.pos": 2.0, "motor_3.pos": 3.0},
+        {"motor_1.pos": 4.0, "motor_2.pos": 5.0, "motor_3.pos": 6.0},
+    )
+
+    assert recorder.save_episode_if_pending()
+    assert fake_dataset.saved_episode_metadata == [{"episode_success": False}]
+
+
+def test_highlight_success_key_does_not_request_another_episode(monkeypatch):
+    from lerobot.async_inference.configs import RobotClientConfig
+    from lerobot.async_inference.recording import RemoteRolloutRecorder
+    from lerobot.configs.dataset import DatasetRecordConfig
+    from lerobot.rollout import HighlightStrategyConfig
+    from tests.mocks.mock_robot import MockRobot, MockRobotConfig
+
+    fake_pynput, _, fake_listener = _make_fake_pynput_module()
+    monkeypatch.setitem(sys.modules, "pynput", fake_pynput)
+    monkeypatch.setattr(RemoteRolloutRecorder, "_create_or_resume_dataset", lambda *_args: _FakeDataset())
+
+    robot = MockRobot(MockRobotConfig(n_motors=3))
+    cfg = RobotClientConfig(
+        robot=robot.config,
+        server_address="localhost:9999",
+        policy_type="test",
+        pretrained_name_or_path="test",
+        actions_per_chunk=20,
+        strategy=HighlightStrategyConfig(),
+        dataset=DatasetRecordConfig(repo_id="user/rollout_highlight", video=False),
+        label_episode_success=True,
+    )
+    recorder = RemoteRolloutRecorder(cfg, robot, logging.getLogger("test"))
+    recorder._setup_episode_label_keyboard(threading.Event())
+    recorder._episode_label_requested.set()
+
+    fake_listener.instances[-1].on_press(SimpleNamespace(char="s"))
+
+    assert recorder._episode_success is True
+    assert not recorder._save_requested.is_set()
 
 
 def test_remote_highlight_recorder_buffers_saves_and_pushes(monkeypatch):

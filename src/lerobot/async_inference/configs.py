@@ -195,6 +195,12 @@ class RobotClientConfig:
     duration: float = field(default=0.0, metadata={"help": "Run duration in seconds. 0 means infinite."})
     resume: bool = field(default=False, metadata={"help": "Resume an existing local recording dataset"})
     play_sounds: bool = field(default=True, metadata={"help": "Play audio prompts for recording events"})
+    label_episode_success: bool = field(
+        default=False,
+        metadata={
+            "help": "Require an S (success) or F (failure) key press before saving each recorded episode"
+        },
+    )
     return_to_initial_position: bool = field(
         default=True,
         metadata={"help": "Return robot to its initial joint position before disconnecting"},
@@ -242,6 +248,14 @@ class RobotClientConfig:
 
         if isinstance(self.strategy, DAggerStrategyConfig) and self.teleop is None:
             raise ValueError("DAgger strategy requires --teleop.type to be set")
+
+        if self.label_episode_success and isinstance(self.strategy, DAggerStrategyConfig):
+            dagger_keys = vars(self.strategy.keyboard).values()
+            if any(str(key).lower() in {"s", "f"} for key in dagger_keys):
+                raise ValueError(
+                    "DAgger keyboard controls cannot use S or F when "
+                    "--label_episode_success=true because those keys are reserved for episode labels"
+                )
 
         needs_dataset = isinstance(
             self.strategy, (SentryStrategyConfig, HighlightStrategyConfig, DAggerStrategyConfig)
@@ -325,5 +339,6 @@ class RobotClientConfig:
             "duration": self.duration,
             "resume": self.resume,
             "play_sounds": self.play_sounds,
+            "label_episode_success": self.label_episode_success,
             "return_to_initial_position": self.return_to_initial_position,
         }

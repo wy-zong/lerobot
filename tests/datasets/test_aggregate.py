@@ -16,6 +16,7 @@
 
 import json
 import logging
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -23,10 +24,11 @@ import pytest
 pytest.importorskip("datasets", reason="datasets is required (install lerobot[dataset])")
 
 import datasets  # noqa: E402
+import pandas as pd
 import torch
 
 from lerobot.configs import VIDEO_ENCODER_INFO_KEYS
-from lerobot.datasets.aggregate import aggregate_datasets
+from lerobot.datasets.aggregate import aggregate_datasets, aggregate_metadata
 from lerobot.datasets.feature_utils import features_equal_for_merge
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 from tests.fixtures.constants import DUMMY_REPO_ID
@@ -690,3 +692,66 @@ def test_aggregate_already_merged_dataset(tmp_path, lerobot_dataset_factory):
 
     # This would raise FileNotFoundError before the fix
     assert_dataset_iteration_works(ds_abc)
+
+
+def test_aggregate_metadata_references_follow_compacted_destination_files(tmp_path):
+    """Metadata rows must reference the destination shard they are physically written to."""
+    source_root = tmp_path / "metadata_source"
+    source_file_0 = source_root / "meta/episodes/chunk-000/file-000.parquet"
+    source_file_1 = source_root / "meta/episodes/chunk-000/file-001.parquet"
+    source_file_0.parent.mkdir(parents=True)
+
+    common_columns = {
+        "data/chunk_index": [0],
+        "data/file_index": [0],
+        "dataset_from_index": [0],
+        "dataset_to_index": [10],
+    }
+    first = pd.DataFrame(
+        {
+            "episode_index": [0],
+            "meta/episodes/chunk_index": [0],
+            "meta/episodes/file_index": [0],
+            **common_columns,
+        }
+    )
+    second = pd.DataFrame(
+        {
+            "episode_index": [1],
+            "meta/episodes/chunk_index": [0],
+            "meta/episodes/file_index": [1],
+            **common_columns,
+        }
+    )
+    first.to_parquet(source_file_0)
+    second.to_parquet(source_file_1)
+
+    source_meta = SimpleNamespace(root=source_root, episodes=pd.concat([first, second]))
+    output_root = tmp_path / "metadata_output"
+    destination_meta = SimpleNamespace(
+        root=output_root,
+        info=SimpleNamespace(total_frames=0, total_episodes=0),
+    )
+    aggregate_metadata(
+        source_meta,
+        destination_meta,
+        meta_idx={"chunk": 0, "file": 0},
+        data_idx={"chunk": 0, "file": 0},
+        videos_idx={},
+    )
+
+    output_metadata_files = sorted((output_root / "meta/episodes").rglob("*.parquet"))
+    assert len(output_metadata_files) == 1
+    output_episodes = pd.read_parquet(output_metadata_files[0])
+    referenced_files = set(
+        zip(
+            output_episodes["meta/episodes/chunk_index"],
+            output_episodes["meta/episodes/file_index"],
+            strict=True,
+        )
+    )
+    assert referenced_files == {(0, 0)}
+
+    for chunk_idx, file_idx in referenced_files:
+        referenced_path = output_root / f"meta/episodes/chunk-{chunk_idx:03d}/file-{file_idx:03d}.parquet"
+        assert referenced_path.exists()

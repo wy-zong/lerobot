@@ -79,7 +79,11 @@ def test_recap_sarm_forward_predict_and_compute_reward():
 
     rewards = model.compute_reward(batch)
     assert rewards.shape == (2,)
-    assert torch.allclose(rewards, outputs["value_expectation"][:, config.n_obs_steps], atol=1e-5)
+    assert torch.allclose(
+        rewards,
+        outputs["value_expectation"][:, config.n_obs_steps // 2],
+        atol=1e-5,
+    )
 
 
 def test_recap_sarm_advantage_helper_bootstraps_and_clips_tail():

@@ -271,7 +271,10 @@ class RECAPSARMRewardModel(PreTrainedRewardModel):
 
     def compute_reward(self, batch: dict[str, Tensor]) -> Tensor:
         outputs = self.predict_value_distribution(batch)
-        frame_index = min(self.config.n_obs_steps, outputs["value_expectation"].shape[1] - 1)
+        frame_index = 0
+        if self.config.temporal_window_mode == "bidirectional":
+            frame_index = self.config.n_obs_steps // 2
+        frame_index = min(frame_index, outputs["value_expectation"].shape[1] - 1)
         return outputs["value_expectation"][:, frame_index]
 
     def forward(self, batch: dict[str, Tensor]) -> tuple[Tensor, dict[str, Any]]:

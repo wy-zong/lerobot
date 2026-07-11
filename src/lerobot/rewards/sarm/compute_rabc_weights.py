@@ -83,6 +83,7 @@ def load_sarm_resources(
     device: str = "cuda",
     image_key_override: str | None = None,
     precomputed_image_features_path: str | None = None,
+    dataset_root: str | Path | None = None,
 ) -> tuple[LeRobotDataset, SARMRewardModel, any]:
     """
     Load SARM model, dataset, and preprocessor.
@@ -111,6 +112,7 @@ def load_sarm_resources(
     logging.info(f"Loading dataset: {dataset_repo_id}")
     temp_dataset = LeRobotDataset(
         dataset_repo_id,
+        root=dataset_root,
         download_videos=not use_precomputed_images,
         skip_video_decode=use_precomputed_images,
     )
@@ -124,6 +126,7 @@ def load_sarm_resources(
 
     dataset = LeRobotDataset(
         dataset_repo_id,
+        root=dataset_root,
         delta_timestamps=delta_timestamps,
         download_videos=not use_precomputed_images,
         skip_video_decode=use_precomputed_images,
@@ -602,6 +605,7 @@ def compute_sarm_progress(
     image_key_override: str | None = None,
     batch_size: int = 1,
     precomputed_image_features_path: str | None = None,
+    dataset_root: str | Path | None = None,
 ):
     """
     Compute SARM progress predictions for all frames in a dataset.
@@ -609,6 +613,7 @@ def compute_sarm_progress(
     Args:
         dataset_repo_id: HuggingFace dataset repo ID or local path
         reward_model_path: Path to pretrained SARM model
+        dataset_root: Optional local dataset root
         output_path: Path to save results. If None, saves to dataset's cache directory
         head_mode: SARM head to use ("sparse", "dense", or "both")
         device: Device to use for inference
@@ -628,6 +633,7 @@ def compute_sarm_progress(
         device,
         image_key_override,
         precomputed_image_features_path,
+        dataset_root,
     )
 
     # Set preprocessor to eval mode to disable augmentations
@@ -871,6 +877,12 @@ Examples:
         help="HuggingFace dataset repo ID or local path",
     )
     parser.add_argument(
+        "--dataset-root",
+        type=str,
+        default=None,
+        help="Optional local dataset root (avoids downloading or resolving the dataset from the Hub)",
+    )
+    parser.add_argument(
         "--reward-model-path",
         type=str,
         default=None,
@@ -952,7 +964,11 @@ Examples:
     reward_model_path = args.reward_model_path
     if reward_model_path is None:
         # Load dataset to find parquet path
-        temp_dataset = LeRobotDataset(args.dataset_repo_id, download_videos=False)
+        temp_dataset = LeRobotDataset(
+            args.dataset_repo_id,
+            root=args.dataset_root,
+            download_videos=False,
+        )
         parquet_path = Path(temp_dataset.root) / "sarm_progress.parquet"
         reward_model_path = get_reward_model_path_from_parquet(parquet_path)
         if reward_model_path:
@@ -970,6 +986,7 @@ Examples:
             args.device,
             args.image_key,
             args.precomputed_image_features_path,
+            args.dataset_root,
         )
         logging.info(f"Visualization-only mode: visualizing {args.num_visualizations} episodes")
         viz_episodes = list(range(min(args.num_visualizations, dataset.num_episodes)))
@@ -989,6 +1006,7 @@ Examples:
     output_path = compute_sarm_progress(
         dataset_repo_id=args.dataset_repo_id,
         reward_model_path=reward_model_path,
+        dataset_root=args.dataset_root,
         output_path=args.output_path,
         head_mode=args.head_mode,
         device=args.device,

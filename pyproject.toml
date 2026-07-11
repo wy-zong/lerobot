@@ -305,6 +305,7 @@ lerobot-edit-dataset="lerobot.scripts.lerobot_edit_dataset:main"
 lerobot-setup-can="lerobot.scripts.lerobot_setup_can:main"
 lerobot-rollout="lerobot.scripts.lerobot_rollout:main"
 lerobot-sarm-precompute-clip="lerobot.scripts.lerobot_sarm_precompute_clip:main"
+lerobot-recap-sarm-annotate="lerobot.rewards.recap_sarm.annotate_dataset:main"
 
 # ---------------- Tool Configurations ----------------
 

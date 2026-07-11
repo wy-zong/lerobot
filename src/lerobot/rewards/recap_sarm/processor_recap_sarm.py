@@ -371,23 +371,24 @@ class RECAPSARMEncodingProcessorStep(SARMEncodingProcessorStep):
         observation["text_features"] = self._encode_text_clip(task, batch_size)
         observation["lengths"] = lengths
 
-        (
-            value_targets_continuous,
-            value_targets_bin,
-            episode_success,
-            remaining_steps,
-        ) = self._compute_recap_targets(
-            frame_indices,
-            episode_indices,
-            lengths,
-            rewind_steps,
-            comp_data,
-            apply_perturbation,
-        )
-        observation["value_targets_continuous"] = value_targets_continuous
-        observation["value_targets_bin"] = value_targets_bin
-        observation["episode_success"] = episode_success
-        observation["remaining_steps"] = remaining_steps
+        if self.training:
+            (
+                value_targets_continuous,
+                value_targets_bin,
+                episode_success,
+                remaining_steps,
+            ) = self._compute_recap_targets(
+                frame_indices,
+                episode_indices,
+                lengths,
+                rewind_steps,
+                comp_data,
+                apply_perturbation,
+            )
+            observation["value_targets_continuous"] = value_targets_continuous
+            observation["value_targets_bin"] = value_targets_bin
+            observation["episode_success"] = episode_success
+            observation["remaining_steps"] = remaining_steps
 
         new_transition[TransitionKey.OBSERVATION] = observation
         return new_transition

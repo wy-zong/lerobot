@@ -119,10 +119,14 @@ def test_recap_sarm_processor_generates_success_and_failure_targets(mock_clip_mo
         ]
     )
     processor = RECAPSARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta)
-    processor.train(False)
+    processor.train()
 
-    success_result = processor(make_transition(config, frame_index=50, episode_index=0, task="stack the cube"))
-    failure_result = processor(make_transition(config, frame_index=150, episode_index=1, task="stack the cube"))
+    success_result = processor(
+        make_transition(config, frame_index=50, episode_index=0, task="stack the cube")
+    )
+    failure_result = processor(
+        make_transition(config, frame_index=150, episode_index=1, task="stack the cube")
+    )
 
     success_obs = success_result[TransitionKey.OBSERVATION]
     failure_obs = failure_result[TransitionKey.OBSERVATION]
@@ -160,7 +164,35 @@ def test_recap_sarm_processor_requires_success_metadata(mock_clip_model):
         ]
     )
     processor = RECAPSARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta)
-    processor.train(False)
+    processor.train()
 
     with pytest.raises(ValueError, match="episode success metadata"):
         processor(make_transition(config, frame_index=50, episode_index=0, task="stack the cube"))
+
+
+def test_recap_sarm_processor_inference_does_not_require_success_metadata(mock_clip_model):
+    from lerobot.rewards.recap_sarm.processor_recap_sarm import RECAPSARMEncodingProcessorStep
+
+    config = RECAPSARMConfig(
+        temporal_window_mode="current_only",
+        rewind_probability=0.0,
+        language_perturbation_probability=0.0,
+    )
+    dataset_meta = MockDatasetMeta(
+        [
+            {
+                "dataset_from_index": 0,
+                "dataset_to_index": 10,
+                "length": 10,
+                "task": "stack the cube",
+            }
+        ]
+    )
+    processor = RECAPSARMEncodingProcessorStep(config=config, dataset_meta=dataset_meta)
+    processor.eval()
+
+    output = processor(make_transition(config, 5, 0, "stack the cube"))[TransitionKey.OBSERVATION]
+
+    assert "video_features" in output
+    assert "value_targets_bin" not in output
+    assert "episode_success" not in output

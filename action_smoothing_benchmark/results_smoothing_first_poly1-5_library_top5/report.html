@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Polynomial 1?5 vs library smoothing</title>
+<style>
+*{box-sizing:border-box}body{font-family:Segoe UI,Arial,sans-serif;margin:0;color:#1d232a;background:#f5f6f8}
+main{max-width:1700px;margin:auto;padding:24px}h1{font-size:28px;margin:0 0 8px}
+section{background:#fff;border:1px solid #d9dde3;margin:16px 0;padding:18px;border-radius:8px;overflow:auto}
+.facts{display:flex;gap:28px;flex-wrap:wrap;margin:14px 0}.facts b{display:block;font-size:21px}
+.note{color:#4f5965;line-height:1.6}code{background:#eef1f4;padding:2px 5px;border-radius:4px}
+table{border-collapse:collapse;width:100%;font-size:13px;min-width:1250px}
+th,td{padding:8px 10px;border-bottom:1px solid #e4e7eb;white-space:nowrap}
+th{background:#f0f3f6;position:sticky;top:0;z-index:1;text-align:right}
+td{text-align:right}th:first-child,td:first-child,th:nth-child(2),td:nth-child(2),th:nth-child(3),td:nth-child(3),th:nth-child(4),td:nth-child(4),th:nth-child(5),td:nth-child(5){text-align:left}
+th.sortable{cursor:pointer;user-select:none}th.sortable:hover,th.sortable:focus{background:#dfe8f2;outline:none}
+.sort-mark{display:inline-block;width:1em;margin-left:4px;color:#1769aa}.rank-cell{font-weight:600;color:#4f5965}
+tbody tr:hover{background:#f7fbff}small{font-weight:400;color:#66717d}
+</style></head><body><main>
+<h1>Action smoothing?polynomial 1?5 ??????</h1>
+<p class="note">??????????????? RMS?????????? runtime p95?????????????????????????????</p>
+<section><div class="facts"><span><b>10</b>????</span><span><b>60 Hz</b>????</span><span><b>50</b>steps / chunk</span><span><b>10 Hz</b>??????</span></div>
+<p class="note"><strong>?????</strong>polynomial_1?5?<strong>????</strong>?? SciPy-backed ? Butterworth?Savitzky?Golay?Gaussian ? smoothing spline ??????????? <code>butterworth_causal_o2_fc3, butterworth_causal_o4_fc3, butterworth_zero_phase_o2_fc3, butterworth_zero_phase_o4_fc3, gaussian_sigma_3</code>?</p>
+<p class="note">????????? <code>jerk_rms</code> ????? <code>acceleration_rms</code> ????????????????? DC ?? FFT ???????????????</p>
+<p class="note">?????<code>C:\Users\ccu\mujoco_ur5_graph\lerobot\action_smoothing_benchmark\results_smoothing_first</code></p></section>
+<section><h2>?????????</h2><table id="comparison-table">
+<thead><tr><th class="rank-header">????</th><th class="sortable" data-sort="method_id" tabindex="0">method_id<span class="sort-mark"></span></th><th class="sortable" data-sort="selection_group" tabindex="0">????<span class="sort-mark"></span></th><th class="sortable" data-sort="implementation" tabindex="0">????<span class="sort-mark"></span></th><th class="sortable" data-sort="causal_label" tabindex="0">causal<span class="sort-mark"></span></th><th class="sortable" data-sort="velocity_rms" tabindex="0">???? RMS<br><small>action unit/s</small><span class="sort-mark"></span></th><th class="sortable" data-sort="acceleration_rms" tabindex="0">???? RMS<br><small>action unit/s?</small><span class="sort-mark"></span></th><th class="sortable" data-sort="jerk_rms" tabindex="0">???? RMS?jerk?<br><small>action unit/s?</small><span class="sort-mark"></span></th><th class="sortable" data-sort="low_frequency_ratio" tabindex="0">??????<span class="sort-mark"></span></th><th class="sortable" data-sort="high_frequency_ratio" tabindex="0">??????<span class="sort-mark"></span></th><th class="sortable" data-sort="runtime_p95_ms" tabindex="0">runtime p95<br><small>ms</small><span class="sort-mark"></span></th></tr></thead>
+<tbody><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">polynomial_1</td><td class="textual" data-key="selection_group">polynomial_1?5??????</td><td class="textual" data-key="implementation">???? least-squares</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="10.7299861481118">10.7300</td><td class="numeric" data-key="acceleration_rms" data-value="1.4086915752823284e-11">1.4087e-11</td><td class="numeric" data-key="jerk_rms" data-value="1.526192886832411e-09">1.5262e-09</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.93406757418404418">93.407%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.065932425815955806">6.593%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.1389">0.1389</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">polynomial_2</td><td class="textual" data-key="selection_group">polynomial_1?5??????</td><td class="textual" data-key="implementation">???? least-squares</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="14.313120489568719">14.3131</td><td class="numeric" data-key="acceleration_rms" data-value="32.554506066294742">32.5545</td><td class="numeric" data-key="jerk_rms" data-value="2.189657287834278e-09">2.1897e-09</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.95385751673554875">95.386%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.046142483264451098">4.614%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.1386">0.1386</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">polynomial_3</td><td class="textual" data-key="selection_group">polynomial_1?5??????</td><td class="textual" data-key="implementation">???? least-squares</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="16.430066995744475">16.4301</td><td class="numeric" data-key="acceleration_rms" data-value="79.41052282565569">79.4105</td><td class="numeric" data-key="jerk_rms" data-value="287.97266338435367">287.9727</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.94609544404322399">94.610%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.053904555956776103">5.390%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.14280000000000001">0.1428</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">polynomial_4</td><td class="textual" data-key="selection_group">polynomial_1?5??????</td><td class="textual" data-key="implementation">???? least-squares</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="18.320185236033783">18.3202</td><td class="numeric" data-key="acceleration_rms" data-value="143.46307083835768">143.4631</td><td class="numeric" data-key="jerk_rms" data-value="1012.6432973814429">1,012.6433</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.95040369097306843">95.040%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.0495963090269314">4.960%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.14949999999999999">0.1495</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">butterworth_zero_phase_o4_fc3</td><td class="textual" data-key="selection_group">SciPy ????jerk/acceleration ?????</td><td class="textual" data-key="implementation">SciPy signal</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="18.248916724537544">18.2489</td><td class="numeric" data-key="acceleration_rms" data-value="138.74122068741551">138.7412</td><td class="numeric" data-key="jerk_rms" data-value="1882.182371040326">1,882.1824</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.95619792682866345">95.620%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.043802073171336602">4.380%</td><td class="numeric" data-key="runtime_p95_ms" data-value="1.1085">1.1085</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">butterworth_zero_phase_o2_fc3</td><td class="textual" data-key="selection_group">SciPy ????jerk/acceleration ?????</td><td class="textual" data-key="implementation">SciPy signal</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="17.757140351195318">17.7571</td><td class="numeric" data-key="acceleration_rms" data-value="138.12286153507213">138.1229</td><td class="numeric" data-key="jerk_rms" data-value="2218.4503264409441">2,218.4503</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.95558047270553603">95.558%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.044419527294463898">4.442%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.89510000000000001">0.8951</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">polynomial_5</td><td class="textual" data-key="selection_group">polynomial_1?5??????</td><td class="textual" data-key="implementation">???? least-squares</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="19.691025583093669">19.6910</td><td class="numeric" data-key="acceleration_rms" data-value="213.19105717350911">213.1911</td><td class="numeric" data-key="jerk_rms" data-value="2390.2163835422512">2,390.2164</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.95075612783134122">95.076%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.049243872168658803">4.924%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.15640000000000001">0.1564</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">butterworth_causal_o4_fc3</td><td class="textual" data-key="selection_group">SciPy ????jerk/acceleration ?????</td><td class="textual" data-key="implementation">SciPy signal</td><td class="textual" data-key="causal_label">causal</td><td class="numeric" data-key="velocity_rms" data-value="15.92177968966954">15.9218</td><td class="numeric" data-key="acceleration_rms" data-value="152.5873762290633">152.5874</td><td class="numeric" data-key="jerk_rms" data-value="2587.608420097858">2,587.6084</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.96715210955027398">96.715%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.032847890449725997">3.285%</td><td class="numeric" data-key="runtime_p95_ms" data-value="1.5248999999999999">1.5249</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">gaussian_sigma_3</td><td class="textual" data-key="selection_group">SciPy ????jerk/acceleration ?????</td><td class="textual" data-key="implementation">SciPy ndimage</td><td class="textual" data-key="causal_label">non-causal</td><td class="numeric" data-key="velocity_rms" data-value="17.055559883580212">17.0556</td><td class="numeric" data-key="acceleration_rms" data-value="174.25763039047601">174.2576</td><td class="numeric" data-key="jerk_rms" data-value="3863.3308503449657">3,863.3309</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.96186636721218699">96.187%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.038133632787812899">3.813%</td><td class="numeric" data-key="runtime_p95_ms" data-value="0.070699999999999999">0.0707</td></tr><tr><td class="rank-cell" data-rank></td><td class="textual" data-key="method_id">butterworth_causal_o2_fc3</td><td class="textual" data-key="selection_group">SciPy ????jerk/acceleration ?????</td><td class="textual" data-key="implementation">SciPy signal</td><td class="textual" data-key="causal_label">causal</td><td class="numeric" data-key="velocity_rms" data-value="17.290608764404997">17.2906</td><td class="numeric" data-key="acceleration_rms" data-value="211.09843191015483">211.0984</td><td class="numeric" data-key="jerk_rms" data-value="6504.8869260306274">6,504.8869</td><td class="numeric" data-key="low_frequency_ratio" data-value="0.96471613252316724">96.472%</td><td class="numeric" data-key="high_frequency_ratio" data-value="0.035283867476832799">3.528%</td><td class="numeric" data-key="runtime_p95_ms" data-value="1.2962">1.2962</td></tr></tbody>
+</table></section>
+</main>
+<script>
+(() => {
+  const table = document.getElementById('comparison-table');
+  const body = table.querySelector('tbody');
+  const headers = Array.from(table.querySelectorAll('th.sortable'));
+  let activeKey = 'jerk_rms';
+  let direction = 1;
+
+  function cellValue(row, key) {
+    const cell = row.querySelector('[data-key="' + key + '"]');
+    return cell ? cell.getAttribute('data-value') ?? cell.textContent.trim() : '';
+  }
+
+  function sortRows(key, dir) {
+    const rows = Array.from(body.querySelectorAll('tr'));
+    rows.sort((left, right) => {
+      const a = cellValue(left, key);
+      const b = cellValue(right, key);
+      const aNumber = Number(a);
+      const bNumber = Number(b);
+      let result;
+      if (Number.isFinite(aNumber) && Number.isFinite(bNumber)) result = aNumber - bNumber;
+      else result = a.localeCompare(b, undefined, {numeric: true, sensitivity: 'base'});
+      return dir * result;
+    });
+    rows.forEach((row, index) => {
+      row.querySelector('[data-rank]').textContent = String(index + 1);
+      body.appendChild(row);
+    });
+    headers.forEach((header) => {
+      const mark = header.querySelector('.sort-mark');
+      const isActive = header.dataset.sort === key;
+      mark.textContent = isActive ? (dir > 0 ? '?' : '?') : '';
+      header.setAttribute('aria-sort', isActive ? (dir > 0 ? 'ascending' : 'descending') : 'none');
+    });
+  }
+
+  function activate(header) {
+    const key = header.dataset.sort;
+    if (activeKey === key) direction *= -1;
+    else { activeKey = key; direction = 1; }
+    sortRows(activeKey, direction);
+  }
+
+  headers.forEach((header) => {
+    header.addEventListener('click', () => activate(header));
+    header.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activate(header); }
+    });
+  });
+  sortRows(activeKey, direction);
+})();
+</script></body></html>

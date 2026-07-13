@@ -1,0 +1,23 @@
+{
+  "source_dir": "C:\\Users\\ccu\\mujoco_ur5_graph\\lerobot\\action_smoothing_benchmark\\results_smoothing_first",
+  "fps": 60.0,
+  "chunk_length": 50,
+  "frequency_split_hz": 10.0,
+  "method_count": 10,
+  "library_method_ids": [
+    "butterworth_causal_o2_fc3",
+    "butterworth_causal_o4_fc3",
+    "butterworth_zero_phase_o2_fc3",
+    "butterworth_zero_phase_o4_fc3",
+    "gaussian_sigma_3"
+  ],
+  "selection_rule": "intersection of five lowest jerk_rms and five lowest acceleration_rms among SciPy-backed families",
+  "displayed_metrics": [
+    "velocity_rms",
+    "acceleration_rms",
+    "jerk_rms",
+    "low_frequency_ratio",
+    "high_frequency_ratio",
+    "runtime_p95_ms"
+  ]
+}

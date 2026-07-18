@@ -1,0 +1,41 @@
+#python -m lerobot.async_inference.policy_server      --host=0.0.0.0      --port=8080 --use_torch_compile=true
+python -m lerobot.async_inference.robot_client `
+    --server_address=192.168.50.198:8080 `
+    --robot.type=bi_so_follower `
+    --robot.left_arm_config.port=COM7 `
+    --robot.right_arm_config.port=COM8 `
+    --robot.id=bimanual_follower `
+    --robot.left_arm_config.cameras='{"camera1": {"type": "opencv", "index_or_path": 1, "width": 640, "height": 480, "fps": 60}, "camera3": {"type": "opencv", "index_or_path": 3, "width": 640, "height": 480, "fps": 60}, "camera4": {"type": "opencv", "index_or_path": 0, "width": 320, "height": 240, "fps": 60}}' `
+    --robot.right_arm_config.cameras='{"camera2": {"type": "opencv", "index_or_path": 2, "width": 320, "height": 240, "fps": 60}}' `
+    --dataset.single_task="flatten and fold the rag then place task:positive" `
+    --policy_type=smolvla `
+    --pretrained_name_or_path='wuc1/bi_so101_ffp_0701_sarm_binary' `
+    --policy_device=cuda `
+    --actions_per_chunk=50 `
+    --inference_mode=sync `
+    --strategy.type=dagger `
+    --strategy.record_autonomous=true `
+    --strategy.num_episodes=340 `
+    --strategy.model_test_mode=true `
+    --teleop.type=bi_so_leader `
+    --teleop.left_arm_config.port=COM4 `
+    --teleop.right_arm_config.port=COM9 `
+    --teleop.id=bimanual_leader `
+    --dataset.repo_id=wuc1/rollout_bi_so101_ffp_0701_sarm_binary `
+    --dataset.video=true `
+    --dataset.push_to_hub=false `
+    --dataset.episode_time_s=300 `
+    --dataset.reset_time_s=5 `
+    --dataset.streaming_encoding=true `
+    --dataset.encoder_threads=2 `
+    --display_data=true `
+    --dataset.fps=60 `
+    --fps=60 `
+    --intra_chunk_smoothing=true `
+    --strategy.upload_every_n_episodes=100 `
+    --label_episode_success=true `
+    # --resume=true `
+    # --dataset.root="C:\Users\ccu\.cache\huggingface\lerobot\wuc1\rollout_bi_so101_ffp_0701_sarm_binary_20260702_053245"
+    #--robot.left_arm_config.max_relative_target=10 `
+    #--robot.right_arm_config.max_relative_target=10 
+ 
